@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import torch
 
-from vjepa_forge.cli.common import parse_recipe_args
+from vjepa_forge.cli.common import parse_config_args
 from vjepa_forge.engine.inference import run_onnx_inference, run_torch_inference
 from vjepa_forge.engine.trainer import build_model
 
 
 def main() -> None:
-    _, _, config = parse_recipe_args("Run prediction with vjepa-forge.")
+    _, _, config = parse_config_args("Run prediction with vjepa-forge.")
     backend = config.get("inference", {}).get("backend", "torch")
     input_type = config.get("input_type", "image")
     image_size = int(config["data"].get("image_size", 384))

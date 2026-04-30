@@ -2,7 +2,7 @@ from pathlib import Path
 
 import torch
 
-from vjepa_forge.configs.loader import load_recipe
+from vjepa_forge.configs.loader import load_config
 from vjepa_forge.data import RandomVideoDetectionDataset, collate_detection_batch
 from vjepa_forge.engine.trainer import build_dataloader, build_model, compute_detection_loss, build_detection_criterion
 
@@ -25,8 +25,8 @@ def test_detection_collate_stacks_video_batch():
 
 
 def test_temporal_detection_model_forward_and_loss():
-    config = load_recipe(
-        Path("vjepa_forge/recipes/detection/imagenet_vid_temporal_detr.yaml"),
+    config = load_config(
+        Path("vjepa_forge/configs/detection/imagenet_vid_temporal_detr.yaml"),
         overrides={"data.name": "random_video_detection", "data.image_size": 32, "data.num_frames": 2, "model.num_classes": 5},
     )
     model = build_model(config)
@@ -42,8 +42,8 @@ def test_temporal_detection_model_forward_and_loss():
 
 
 def test_detection_video_dataloader_dispatches_temporal_recipe():
-    config = load_recipe(
-        Path("vjepa_forge/recipes/detection/imagenet_vid_temporal_detr.yaml"),
+    config = load_config(
+        Path("vjepa_forge/configs/detection/imagenet_vid_temporal_detr.yaml"),
         overrides={"data.name": "random_video_detection", "data.image_size": 32, "data.num_frames": 2, "data.batch_size": 1, "model.num_classes": 5},
     )
     loader = build_dataloader(config)

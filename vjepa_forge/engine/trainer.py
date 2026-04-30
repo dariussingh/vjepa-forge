@@ -280,7 +280,7 @@ def train(config: dict[str, Any]) -> TrainResult:
             loss.backward()
             optimizer.step()
             steps += 1
-    checkpoint_path = str((Path(config["_recipe_path"]).parent / "last.pt").resolve())
+    checkpoint_path = str((Path(config["_config_path"]).parent / "last.pt").resolve())
     save_checkpoint(model, checkpoint_path)
     return TrainResult(checkpoint_path=checkpoint_path, steps=steps)
 

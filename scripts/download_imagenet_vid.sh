@@ -12,7 +12,7 @@ Expected layout:
     Annotations/VID/val/...
 
 Example recipe:
-  vjepa-forge train recipe=vjepa_forge/recipes/detection/imagenet_vid_temporal_detr.yaml
+  vjepa-forge train config=vjepa_forge/configs/detection/imagenet_vid_temporal_detr.yaml
 
 Place the extracted ImageNet VID dataset under ./data/imagenet_vid and rerun.
 EOF

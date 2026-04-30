@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from typing import Any
 
-from vjepa_forge.configs.loader import load_recipe, parse_override_value
+from vjepa_forge.configs.loader import load_config, parse_override_value
 
 
 def parse_kv_pairs(items: list[str]) -> dict[str, Any]:
@@ -16,13 +16,19 @@ def parse_kv_pairs(items: list[str]) -> dict[str, Any]:
     return overrides
 
 
-def parse_recipe_args(description: str) -> tuple[argparse.ArgumentParser, argparse.Namespace, dict[str, Any]]:
+def parse_config_args(description: str) -> tuple[argparse.ArgumentParser, argparse.Namespace, dict[str, Any]]:
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
     overrides = parse_kv_pairs(args.overrides)
-    recipe = overrides.pop("recipe", None)
-    if not recipe:
-        raise SystemExit("Pass recipe=<path-to-yaml>")
-    config = load_recipe(recipe, overrides=overrides)
+    config_path = overrides.pop("config", None)
+    if config_path is None:
+        config_path = overrides.pop("recipe", None)
+    if not config_path:
+        raise SystemExit("Pass config=<path-to-yaml>")
+    config = load_config(config_path, overrides=overrides)
     return parser, args, config
+
+
+def parse_recipe_args(description: str) -> tuple[argparse.ArgumentParser, argparse.Namespace, dict[str, Any]]:
+    return parse_config_args(description)

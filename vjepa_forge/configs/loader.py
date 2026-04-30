@@ -65,7 +65,7 @@ def load_yaml(path: str | Path) -> dict[str, Any]:
         config = yaml.safe_load(handle)
     if not isinstance(config, dict):
         raise TypeError(f"Expected mapping config at {config_path}")
-    config["_recipe_path"] = str(config_path)
+    config["_config_path"] = str(config_path)
     return resolve_paths(config, config_path.parent)
 
 
@@ -73,10 +73,14 @@ def load_defaults() -> dict[str, Any]:
     return load_yaml(Path(__file__).with_name("defaults.yaml"))
 
 
-def load_recipe(path: str | Path, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
     config = deep_merge(load_defaults(), load_yaml(path))
     if overrides:
         config = apply_overrides(config, overrides)
     if "references" not in config:
-        raise ValueError("Recipes must define a references block")
+        raise ValueError("Configs must define a references block")
     return config
+
+
+def load_recipe(path: str | Path, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+    return load_config(path, overrides=overrides)

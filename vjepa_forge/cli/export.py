@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import torch
 
-from vjepa_forge.cli.common import parse_recipe_args
+from vjepa_forge.cli.common import parse_config_args
 from vjepa_forge.engine.trainer import build_model
 from vjepa_forge.export import export_to_onnx
 
 
 def main() -> None:
-    _, _, config = parse_recipe_args("Export a vjepa-forge model.")
+    _, _, config = parse_config_args("Export a vjepa-forge model.")
     if config["task"] == "detection" and config.get("input_type", "image") == "video":
         raise SystemExit("Video detection ONNX export is not supported yet. Use backend=torch for temporal detection inference.")
     model = build_model(config)
