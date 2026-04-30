@@ -9,6 +9,8 @@ from vjepa_forge.export import export_to_onnx
 
 def main() -> None:
     _, _, config = parse_recipe_args("Export a vjepa-forge model.")
+    if config["task"] == "detection" and config.get("input_type", "image") == "video":
+        raise SystemExit("Video detection ONNX export is not supported yet. Use backend=torch for temporal detection inference.")
     model = build_model(config)
     input_type = config.get("input_type", "image")
     image_size = int(config["data"].get("image_size", 384))

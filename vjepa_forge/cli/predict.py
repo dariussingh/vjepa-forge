@@ -23,4 +23,11 @@ def main() -> None:
     else:
         model = build_model(config)
         outputs = run_torch_inference(model, batch)
+    if isinstance(outputs, dict):
+        summary = {key: list(value.shape) if hasattr(value, "shape") else type(value).__name__ for key, value in outputs.items()}
+        print(summary)
+        return
+    if hasattr(outputs, "shape"):
+        print(list(outputs.shape))
+        return
     print(type(outputs).__name__)
