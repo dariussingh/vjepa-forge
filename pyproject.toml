@@ -30,7 +30,7 @@ vjepa-forge = "vjepa_forge.cli.main:main"
 include-package-data = true
 
 [tool.setuptools.packages.find]
-include = ["vjepa_forge*", "src*", "app*", "rfdetr*"]
+include = ["vjepa_forge*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

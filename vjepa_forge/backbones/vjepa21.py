@@ -8,8 +8,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from app.vjepa_2_1.models import vision_transformer as vjepa_vit
-from src.utils.checkpoint_loader import robust_checkpoint_loader
+from vjepa_forge.models import vision_transformer as vjepa_vit
+from vjepa_forge.utils.checkpoint_loader import robust_checkpoint_loader
 
 logger = logging.getLogger(__name__)
 

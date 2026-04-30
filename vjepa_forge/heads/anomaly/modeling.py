@@ -6,10 +6,10 @@ from pathlib import Path
 import torch
 from torch import nn
 
-from app.vjepa_2_1.models.utils.modules import Block
-from src.hub.backbones import vjepa2_1_vit_base_384
-from src.utils.checkpoint_loader import robust_checkpoint_loader
-from src.utils.tensors import trunc_normal_
+from vjepa_forge.backbones.factory import vjepa2_1_vit_base_384
+from vjepa_forge.models.utils.modules import Block
+from vjepa_forge.utils.checkpoint_loader import robust_checkpoint_loader
+from vjepa_forge.utils.tensors import trunc_normal_
 
 
 def _clean_backbone_key(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
