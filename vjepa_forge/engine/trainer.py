@@ -5,18 +5,25 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader
 
 from vjepa_forge.backbones import VJEPAImageBackbone, VJEPAVideoBackbone
 from vjepa_forge.data import (
+    ADE20KSegmentationDataset,
+    COCODetectionDataset,
+    COCOInstanceSegmentationDataset,
     ImageNetVIDDataset,
+    ImageNet1KDataset,
+    Kinetics400Dataset,
     RandomDetectionDataset,
     RandomImageDataset,
     RandomSegmentationDataset,
     RandomVideoDataset,
     RandomVideoDetectionDataset,
     collate_detection_batch,
+    collate_instance_segmentation_batch,
 )
 from vjepa_forge.engine.checkpointing import save_checkpoint
 from vjepa_forge.heads.classification import ImageClassificationHead, VideoClassificationHead
@@ -142,12 +149,22 @@ def build_dataset(config: dict[str, Any], *, split: str = "train"):
     image_size = int(config["data"].get("image_size", 384))
     num_classes = int(config["model"].get("num_classes", 10))
     if task == "classification":
+        dataset_name = str(config["data"].get("name", "")).lower()
         if config.get("input_type", "image") == "video":
-            return RandomVideoDataset(image_size=image_size, num_frames=int(config["data"].get("num_frames", 8)), num_classes=num_classes)
-        return RandomImageDataset(image_size=image_size, num_classes=num_classes)
+            if dataset_name == "kinetics400":
+                return Kinetics400Dataset(config["data"]["root"], split=split, image_size=image_size, num_frames=int(config["data"].get("num_frames", 8)))
+            if dataset_name == "random_video_classification":
+                return RandomVideoDataset(image_size=image_size, num_frames=int(config["data"].get("num_frames", 8)), num_classes=num_classes)
+            raise ValueError(f"Unsupported video classification dataset: {dataset_name}")
+        if dataset_name == "imagenet1k":
+            return ImageNet1KDataset(config["data"]["root"], split=split, image_size=image_size)
+        if dataset_name == "random_image_classification":
+            return RandomImageDataset(image_size=image_size, num_classes=num_classes)
+        raise ValueError(f"Unsupported image classification dataset: {dataset_name}")
     if task == "detection":
+        dataset_name = str(config["data"].get("name", "")).lower()
         if config.get("input_type", "image") == "video":
-            if str(config["data"].get("name", "random_video_detection")).lower() == "imagenet_vid":
+            if dataset_name == "imagenet_vid":
                 return ImageNetVIDDataset(
                     config["data"]["root"],
                     split=split,
@@ -156,14 +173,32 @@ def build_dataset(config: dict[str, Any], *, split: str = "train"):
                     clip_stride=int(config["data"].get("clip_stride", 1)),
                     max_clips=config["data"].get("max_clips"),
                 )
-            return RandomVideoDetectionDataset(
-                image_size=image_size,
-                num_frames=int(config["data"].get("num_frames", 8)),
-                num_classes=num_classes,
-            )
-        return RandomDetectionDataset(image_size=image_size, num_classes=num_classes)
+            if dataset_name == "random_video_detection":
+                return RandomVideoDetectionDataset(
+                    image_size=image_size,
+                    num_frames=int(config["data"].get("num_frames", 8)),
+                    num_classes=num_classes,
+                )
+            raise ValueError(f"Unsupported video detection dataset: {dataset_name}")
+        if dataset_name == "coco":
+            return COCODetectionDataset(config["data"]["root"], split=split, image_size=image_size)
+        if dataset_name == "random_detection":
+            return RandomDetectionDataset(image_size=image_size, num_classes=num_classes)
+        raise ValueError(f"Unsupported image detection dataset: {dataset_name}")
     if task == "segmentation":
-        return RandomSegmentationDataset(image_size=image_size, num_classes=num_classes)
+        dataset_name = str(config["data"].get("name", "")).lower()
+        seg_type = config.get("segmentation_type", "semantic")
+        if seg_type == "instance":
+            if dataset_name == "coco":
+                return COCOInstanceSegmentationDataset(config["data"]["root"], split=split, image_size=image_size)
+            if dataset_name == "random_instance_segmentation":
+                return RandomSegmentationDataset(image_size=image_size, num_classes=num_classes)
+            raise ValueError(f"Unsupported instance segmentation dataset: {dataset_name}")
+        if dataset_name == "ade20k":
+            return ADE20KSegmentationDataset(config["data"]["root"], split=split, image_size=image_size)
+        if dataset_name == "random_semantic_segmentation":
+            return RandomSegmentationDataset(image_size=image_size, num_classes=num_classes)
+        raise ValueError(f"Unsupported semantic segmentation dataset: {dataset_name}")
     raise ValueError(f"Unsupported dataset task: {task}")
 
 
@@ -172,6 +207,8 @@ def build_dataloader(config: dict[str, Any], *, split: str = "train") -> DataLoa
     batch_size = int(config["data"].get("batch_size", 2))
     if config["task"] == "detection":
         return DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_detection_batch)
+    if config["task"] == "segmentation" and config.get("segmentation_type", "semantic") == "instance":
+        return DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_instance_segmentation_batch)
     return DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
 
@@ -247,6 +284,30 @@ def _compute_loss(
         loss = criterion(logits, labels.to(device))
         return loss, {"top1": top1_accuracy(logits.detach().cpu(), labels)}
     if config["task"] == "segmentation":
+        if config.get("segmentation_type", "semantic") == "instance":
+            inputs, targets = batch
+            outputs = model(inputs.to(device))
+            max_queries = outputs["pred_logits"].shape[1]
+            class_targets = torch.full(
+                outputs["pred_logits"].shape[:2],
+                int(config["model"].get("num_classes", 8)),
+                dtype=torch.int64,
+                device=device,
+            )
+            mask_loss = outputs["pred_masks"].sum() * 0.0
+            for batch_idx, target in enumerate(targets):
+                labels = target["labels"].to(device)
+                masks = target["masks"].to(device)
+                count = min(max_queries, labels.numel())
+                if count > 0:
+                    class_targets[batch_idx, :count] = labels[:count]
+                    mask_loss = mask_loss + F.binary_cross_entropy_with_logits(
+                        outputs["pred_masks"][batch_idx, :count],
+                        masks[:count],
+                    )
+            class_loss = F.cross_entropy(outputs["pred_logits"].transpose(1, 2), class_targets)
+            loss = class_loss + mask_loss
+            return loss, {"instance_loss": float(loss.detach().cpu().item())}
         inputs, labels = batch
         logits = model(inputs.to(device))
         loss = criterion(logits, labels.to(device))

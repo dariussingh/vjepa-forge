@@ -45,6 +45,7 @@ def apply_overrides(config: dict[str, Any], overrides: dict[str, Any]) -> dict[s
 
 
 def resolve_paths(config: dict[str, Any], root: Path) -> dict[str, Any]:
+    repo_root = Path(__file__).resolve().parents[2]
     for parent_key, child_key in (
         ("model", "checkpoint"),
         ("data", "root"),
@@ -55,7 +56,7 @@ def resolve_paths(config: dict[str, Any], root: Path) -> dict[str, Any]:
         if isinstance(section, dict) and section.get(child_key):
             value = Path(str(section[child_key])).expanduser()
             if not value.is_absolute():
-                section[child_key] = str((root / value).resolve())
+                section[child_key] = str((repo_root / value).resolve())
     return config
 
 

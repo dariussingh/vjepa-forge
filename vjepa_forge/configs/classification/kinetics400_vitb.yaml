@@ -12,6 +12,8 @@ model:
     name: vit_base
     checkpoint: null
 data:
+  name: kinetics400
+  root: data/kinetics400
   image_size: 384
   num_frames: 8
   batch_size: 1

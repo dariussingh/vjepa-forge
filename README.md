@@ -116,6 +116,15 @@ vjepa-forge train \
 
 `vjepa-forge` expects datasets under `data/` and checkpoints under `weights/`.
 
+Default dataset roots used by the shipped configs:
+
+- ImageNet-1K: `data/imagenet1k`
+- Kinetics-400: `data/kinetics400`
+- COCO detection / instance segmentation: `data/coco`
+- ImageNet VID: `data/imagenet_vid`
+- ADE20K: `data/ade20k`
+- UCSD Ped2 anomaly: `data/ucsd_ped2`
+
 ImageNet VID layout:
 
 ```text
@@ -128,6 +137,46 @@ data/imagenet_vid/
     VID/
       train/
       val/
+```
+
+ImageNet-1K layout:
+
+```text
+data/imagenet1k/
+  train/<class_name>/*.jpg
+  val/<class_name>/*.jpg
+```
+
+Kinetics-400 layout:
+
+```text
+data/kinetics400/
+  train/<class_name>/*.mp4
+  val/<class_name>/*.mp4
+```
+
+COCO layout:
+
+```text
+data/coco/
+  images/
+    train2017/
+    val2017/
+  annotations/
+    instances_train2017.json
+    instances_val2017.json
+```
+
+ADE20K layout:
+
+```text
+data/ade20k/
+  images/
+    training/
+    validation/
+  annotations/
+    training/
+    validation/
 ```
 
 Helper scripts:
