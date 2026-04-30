@@ -1,0 +1,19 @@
+name: vjepa21_instance_coco
+task: segmentation
+input_type: image
+segmentation_type: instance
+references:
+  backbone: [vjepa2_1]
+  dense_features: [dinov3]
+  detection: [detr, rf_detr]
+  training_interface: [ultralytics]
+model:
+  num_classes: 80
+  backbone:
+    name: vit_base
+    checkpoint: null
+data:
+  image_size: 384
+  batch_size: 1
+train:
+  epochs: 1

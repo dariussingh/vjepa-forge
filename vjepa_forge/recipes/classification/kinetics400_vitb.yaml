@@ -1,0 +1,19 @@
+name: vjepa21_kinetics400_vitb
+task: classification
+input_type: video
+references:
+  backbone: [vjepa2_1]
+  dense_features: [dinov3]
+  detection: [detr, rf_detr]
+  training_interface: [ultralytics]
+model:
+  num_classes: 400
+  backbone:
+    name: vit_base
+    checkpoint: null
+data:
+  image_size: 384
+  num_frames: 8
+  batch_size: 1
+train:
+  epochs: 1

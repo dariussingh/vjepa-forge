@@ -1,0 +1,30 @@
+name: vjepa21_rf_detr_coco
+task: detection
+input_type: image
+references:
+  backbone: [vjepa2_1]
+  dense_features: [dinov3]
+  detection: [detr, rf_detr]
+  training_interface: [ultralytics]
+model:
+  num_classes: 80
+  imgsz: 384
+  in_channels: 3
+  adapter_channels: 256
+  neck:
+    type: enhanced_p2
+    out_channels: 256
+    detail_channels: 128
+  backbone:
+    name: vit_base
+    checkpoint: null
+detector:
+  hidden_dim: 256
+  num_queries: 100
+  num_heads: 8
+  num_decoder_layers: 4
+data:
+  image_size: 384
+  batch_size: 1
+train:
+  epochs: 1

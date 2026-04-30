@@ -1,0 +1,51 @@
+task: classification
+input_type: image
+references:
+  backbone: [vjepa, vjepa2, vjepa2_1]
+  dense_features: [dinov3]
+  detection: [detr, rf_detr]
+  training_interface: [ultralytics]
+model:
+  name: vjepa21_base
+  num_classes: 10
+  backbone:
+    name: vit_base
+    checkpoint: null
+    checkpoint_key: ema_encoder
+    freeze: false
+    input_type: image_video
+    output_layers: [2, 5, 8, 11]
+    dense_features: true
+    temporal_features: true
+data:
+  root: data
+  image_size: 384
+  num_frames: 8
+  batch_size: 2
+  num_workers: 0
+train:
+  epochs: 1
+  lr: 0.0001
+  weight_decay: 0.0001
+  device: cpu
+eval:
+  metrics: []
+  checkpoint_path: null
+predict:
+  source: null
+distributed:
+  backend: torchrun
+  strategy: ddp
+  precision: fp32
+  gradient_accumulation: 1
+  sync_batchnorm: false
+  compile: false
+export:
+  format: onnx
+  opset: 17
+  dynamic_axes: true
+  simplify: false
+  backend: onnxruntime
+inference:
+  backend: torch
+  providers: [CPUExecutionProvider]

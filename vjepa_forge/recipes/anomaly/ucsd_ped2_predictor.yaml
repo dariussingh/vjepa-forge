@@ -1,0 +1,37 @@
+name: vjepa21_ped2_predictor
+task: anomaly
+input_type: video
+references:
+  backbone: [vjepa2_1]
+  dense_features: [dinov3]
+  detection: [detr, rf_detr]
+  training_interface: [ultralytics]
+dataset:
+  name: ped2
+  root: data/ucsd_ped2
+  category: UCSDped2
+  split_seed: 7
+  val_ratio: 0.25
+  image_size: 384
+  past_frames: 8
+  future_frames: 8
+  stride: 1
+model:
+  name: vjepa2_1_vit_base_384
+  checkpoint: weights/vjepa2_1_vitb_dist_vitG_384.pt
+  checkpoint_key: ema_encoder
+  hidden_dim: 1024
+  dropout: 0.1
+train:
+  batch_size: 4
+  epochs: 1
+  lr: 0.0001
+  weight_decay: 0.0001
+  num_workers: 0
+  device: cpu
+eval:
+  batch_size: 4
+  num_workers: 0
+  threshold_std_multiplier: 3.0
+output:
+  root: outputs/vjepa-anomaly/ucsd_ped2_vitb

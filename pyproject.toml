@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vjepa-forge"
+version = "0.1.0"
+description = "Forge image and video downstream models from V-JEPA 2.1."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "torch>=2.2",
+  "torchvision",
+  "pyyaml",
+  "numpy",
+  "einops",
+  "timm",
+  "Pillow",
+]
+
+[project.optional-dependencies]
+detection = ["ultralytics", "faster-coco-eval", "scipy"]
+onnx = ["onnx", "onnxruntime"]
+dev = ["pytest"]
+
+[project.scripts]
+vjepa-forge = "vjepa_forge.cli.main:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["vjepa_forge*", "src*", "app*", "rfdetr*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
