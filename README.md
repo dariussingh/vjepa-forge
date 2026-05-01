@@ -1,8 +1,51 @@
 # vjepa-forge
 
-Canonical image/video training framework for V-JEPA 2.1-style downstream tasks.
+<p align="center">
+  <strong>Train image and video downstream models with V-JEPA 2.1-style backbones from one CLI.</strong>
+</p>
 
-## CLI
+<p align="center">
+  Classification, detection, segmentation, and anomaly workflows built around a single Forge dataset format.
+</p>
+
+<p align="center">
+  <a href="#install">Install</a> |
+  <a href="#supported-tasks">Supported Tasks</a> |
+  <a href="#getting-started">Getting Started</a> |
+  <a href="#training">Training</a> |
+  <a href="#validation">Validation</a> |
+  <a href="#inference">Inference</a> |
+  <a href="#dataset-conversion">Dataset Conversion</a> |
+  <a href="#forge-datasets">Forge Datasets</a> |
+  <a href="#python-api">Python API</a>
+</p>
+
+## Install
+
+```bash
+git clone git@github.com:dariussingh/vjepa-forge.git
+cd vjepa-forge
+python -m pip install -e .
+```
+
+Optional extras:
+
+```bash
+python -m pip install -e .[detection,onnx,dev]
+```
+
+## Supported Tasks
+
+| Task | Media | Support |
+| --- | --- | --- |
+| Classification | Image, Video | Train, val, predict |
+| Detection | Image, Video | Train, val, predict |
+| Segmentation | Image, Video | Train, val, predict |
+| Anomaly | Image, Video | Train, val, predict |
+
+## Getting Started
+
+The new CLI is task-first:
 
 ```bash
 forge classify train model=vjepa21-b.yaml data=kinetics400.yaml
@@ -11,46 +54,201 @@ forge segment train model=vjepa21-vos.yaml data=davis.yaml
 forge anomaly train model=vjepa21-predictor.yaml data=ucsd_ped2.yaml
 ```
 
-Converters are the only place external dataset formats belong:
+You can keep datasets anywhere on disk. Each `data=...` argument points to a Forge dataset YAML, either:
+
+- a shipped dataset config under `vjepa_forge/cfg/datasets/`
+- your own `forge.yaml` path
+
+## Training
+
+Image classification:
+
+```bash
+forge classify train model=vjepa21-b.yaml data=/data/imagenet_forge/forge.yaml
+```
+
+Video classification:
+
+```bash
+forge classify train model=vjepa21-b.yaml data=/data/kinetics_forge/forge.yaml
+```
+
+Image detection:
+
+```bash
+forge detect train model=vjepa21-rfdetr.yaml data=/data/coco_forge/forge.yaml
+```
+
+Video detection:
+
+```bash
+forge detect train model=vjepa21-rfdetr.yaml data=/data/imagenet_vid_forge/forge.yaml
+```
+
+Overrides still use `key=value`:
+
+```bash
+forge classify train \
+  model=vjepa21-b.yaml \
+  data=/data/kinetics_forge/forge.yaml \
+  train.epochs=10 \
+  train.batch_size=4 \
+  train.device=cpu
+```
+
+## Validation
+
+```bash
+forge classify val model=vjepa21-b.yaml data=/data/imagenet_forge/forge.yaml
+forge detect val model=vjepa21-rfdetr.yaml data=/data/coco_forge/forge.yaml
+```
+
+## Inference
+
+```bash
+forge classify predict model=vjepa21-b.yaml data=/data/imagenet_forge/forge.yaml
+forge anomaly predict model=vjepa21-predictor.yaml data=/data/ucsd_forge/forge.yaml
+```
+
+## Dataset Conversion
+
+External dataset formats should be converted into the canonical Forge layout before training.
+
+Examples:
 
 ```bash
 forge convert coco source=/data/coco out=/data/coco_forge task=detect media=image
 forge convert kinetics source=/data/kinetics out=/data/kinetics_forge task=classify media=video
+forge convert davis source=/data/DAVIS out=/data/davis_forge task=segment media=video
+forge convert ucsd source=/data/UCSDped2 out=/data/ucsd_forge task=anomaly media=video
 ```
 
-## Dataset Format
+## Forge Datasets
 
-Each dataset is described by a `forge.yaml` file with one `task` and one `media`:
+Each dataset split is either `media: image` or `media: video`.
+
+Canonical layout:
+
+```text
+dataset/
+  forge.yaml
+  images/
+    train/
+    val/
+  videos/
+    train/
+    val/
+  labels/
+    train/
+    val/
+  masks/
+    train/
+    val/
+  splits/
+    train.txt
+    val.txt
+    test.txt
+```
+
+Example `forge.yaml`:
 
 ```yaml
 path: /data/my_dataset
+
 task: detect
 media: image
+
 names:
   0: person
+  1: car
+
 splits:
   train: splits/train.txt
   val: splits/val.txt
+  test: splits/test.txt
+
 labels:
   format: forge-yolo
   root: labels
+
+masks:
+  root: masks
 ```
 
-Image runs use `x: [B, C, H, W]`. Video runs use `x: [B, T, C, H, W]`.
+Image split files contain media-relative paths such as:
 
-Video annotations may be frame-aware, but model execution is always clip-level.
+```text
+images/train/000001.jpg
+images/train/000002.jpg
+```
+
+Video split files contain media-relative paths such as:
+
+```text
+videos/train/clip001.mp4
+videos/train/clip002.mp4
+```
+
+Matching labels live under `labels/<split>/` with the same stem:
+
+```text
+images/train/000001.jpg -> labels/train/000001.txt
+videos/train/clip001.mp4 -> labels/train/clip001.txt
+```
+
+## Label Format
+
+Classification:
+
+```text
+cls <class_id>
+cls <class_id> <start_frame> <end_frame>
+```
+
+Detection:
+
+```text
+det <class_id> <x_center> <y_center> <width> <height>
+det <frame_idx> <class_id> <x_center> <y_center> <width> <height>
+```
+
+Segmentation:
+
+```text
+seg <class_id> <x1> <y1> ... <xn> <yn>
+seg <frame_idx> <class_id> <x1> <y1> ... <xn> <yn>
+```
+
+Anomaly:
+
+```text
+ano normal
+ano abnormal <class_id>
+ano abnormal <start_frame> <end_frame> <class_id>
+```
+
+The runtime parser also supports `ano_box` and `ano_seg` for optional spatial anomaly supervision.
 
 ## Python API
 
 ```python
 from vjepa_forge import ForgeModel
 
-model = ForgeModel("vjepa21-rfdetr.yaml", data={"task": "detect", "media": "image", "image_size": 64})
+model = ForgeModel(
+    "vjepa21-rfdetr.yaml",
+    data={"task": "detect", "media": "image", "image_size": 64},
+)
 ```
 
 ## Notes
 
-- `media` is only `image` or `video`
-- there is no mixed-media dataset type
-- runtime parsing uses one canonical Forge text-label parser
-- dataset-specific runtime loaders are replaced by converters plus task/media loaders
+- A run is always single-media: image or video.
+- Video labels may be frame-aware, but model execution is clip-level.
+- Mixed image+video pretraining is not a dataset type.
+- The canonical runtime parser is text-based; JSON labels are not used.
+
+## License
+
+This repository is released under the MIT License.
+
+Some copied or adapted upstream components are covered by their original notices. See [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md).
