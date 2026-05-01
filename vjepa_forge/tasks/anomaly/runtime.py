@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from vjepa_forge.data.forge.dataset import ForgeDataset
 from vjepa_forge.data.video import get_video_frame_count, read_video_clip
+from vjepa_forge.engine.checkpointing import checkpoint_paths, checkpoint_payload, load_checkpoint, resolve_resume_path, resolve_run_dir, results_csv_rows, save_checkpoint, write_results_csv
 from vjepa_forge.heads.anomaly.modeling import ExtractedFeatures, build_feature_extractor, build_predictor
 
 try:
@@ -43,7 +44,8 @@ class WindowRecord:
 class AnomalyTrainResult:
     best_val_loss: float
     best_checkpoint: str
-    latest_checkpoint: str
+    last_checkpoint: str
+    run_dir: str
 
 
 @dataclass
@@ -150,15 +152,14 @@ def _resolve_device(device_str: str) -> torch.device:
 
 
 def _make_output_root(cfg: dict[str, Any]) -> Path:
-    output_cfg = cfg.get("output", {})
-    root = output_cfg.get("root")
-    if root:
-        path = Path(root)
-        if not path.is_absolute():
-            path = (_repo_root() / path).resolve()
-        return path
-    data_path = Path(cfg["dataset"]["dataset_yaml"])
-    return (_repo_root() / "outputs" / "vjepa-forge" / "anomaly" / data_path.parent.name).resolve()
+    return resolve_run_dir(
+        task="anomaly",
+        data=cfg["dataset"]["dataset_yaml"],
+        project=cfg["train"].get("project") or cfg.get("output", {}).get("root"),
+        name=cfg["train"].get("name"),
+        exist_ok=bool(cfg["train"].get("exist_ok", False) or cfg.get("action") != "train"),
+        resume=cfg["train"].get("resume", False) if cfg.get("action") == "train" else True,
+    )
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -190,6 +191,7 @@ def _build_cfg(config: dict[str, Any], *, action: str) -> dict[str, Any]:
     output_root = config.get("output", {}).get("root")
     default_workers = max(1, min(8, os.cpu_count() or 1))
     return {
+        "action": action,
         "dataset": {
             "dataset_yaml": str(dataset_yaml),
             "image_size": int(data_cfg.get("image_size", 384)),
@@ -215,6 +217,12 @@ def _build_cfg(config: dict[str, Any], *, action: str) -> dict[str, Any]:
         "train": {
             "batch_size": int(config["train"].get("batch_size", 1)),
             "epochs": int(config["train"].get("epochs", 10)),
+            "save": bool(config["train"].get("save", True)),
+            "save_period": int(config["train"].get("save_period", 0)),
+            "resume": config["train"].get("resume", False),
+            "project": config["train"].get("project"),
+            "name": config["train"].get("name"),
+            "exist_ok": bool(config["train"].get("exist_ok", False)),
             "lr_mode": str(config["train"].get("lr_mode", "manual")),
             "lr": float(config["train"].get("lr", 1.0e-4)),
             "reference_batch_size": int(config["train"].get("reference_batch_size", config["train"].get("batch_size", 1))),
@@ -529,16 +537,25 @@ def _build_smoothed_summary(video_summary: dict[str, Any], smoothing_window: int
 
 
 def _checkpoint_payload(predictor: nn.Module, cfg: dict[str, Any], *, epoch: int, train_loss: float, val_loss: float, best_val_loss: float, effective_lr: float, checkpoint_kind: str) -> dict[str, Any]:
-    return {
-        "predictor_state": predictor.state_dict(),
-        "config": cfg,
-        "epoch": epoch,
-        "train_loss": train_loss,
-        "val_loss": val_loss,
-        "best_val_loss": best_val_loss,
-        "effective_lr": effective_lr,
-        "checkpoint_kind": checkpoint_kind,
-    }
+    return checkpoint_payload(
+        model_state=predictor.state_dict(),
+        optimizer_state=None,
+        scheduler_state=None,
+        epoch=epoch,
+        global_step=0,
+        best_fitness=best_val_loss,
+        metrics={
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "effective_lr": effective_lr,
+        },
+        config=cfg,
+        task="anomaly",
+        media="video",
+        checkpoint_kind=checkpoint_kind,
+        component="predictor",
+        extras={"predictor_state": predictor.state_dict(), "effective_lr": effective_lr},
+    )
 
 
 def _resolve_effective_lr(train_cfg: dict[str, Any]) -> tuple[float, dict[str, Any]]:
@@ -565,7 +582,7 @@ def _resolve_effective_lr(train_cfg: dict[str, Any]) -> tuple[float, dict[str, A
 def _resolve_checkpoint_path(cfg: dict[str, Any], section: str) -> Path:
     explicit_path = cfg[section].get("checkpoint_path")
     output_root = _make_output_root(cfg)
-    checkpoint_dir = output_root / "checkpoints"
+    checkpoint_dir = checkpoint_paths(output_root).weights_dir
     if explicit_path:
         path = Path(explicit_path)
         if not path.is_absolute():
@@ -573,9 +590,9 @@ def _resolve_checkpoint_path(cfg: dict[str, Any], section: str) -> Path:
         return path
     target = str(cfg[section].get("checkpoint_target", "best"))
     if target == "best":
-        return checkpoint_dir / "best_predictor.pt"
-    if target == "latest":
-        return checkpoint_dir / "latest_predictor.pt"
+        return checkpoint_dir / "best.pt"
+    if target in {"latest", "last"}:
+        return checkpoint_dir / "last.pt"
     raise ValueError(f"Unsupported checkpoint target: {target}")
 
 
@@ -585,9 +602,9 @@ def train_from_runtime_config(config: dict[str, Any]) -> AnomalyTrainResult:
     _seed_everything(cfg["train"]["seed"])
     loaders = _make_loaders(cfg, include_test=False)
     output_root = _make_output_root(cfg)
-    checkpoints = output_root / "checkpoints"
+    paths = checkpoint_paths(output_root)
     reports = output_root / "reports"
-    checkpoints.mkdir(parents=True, exist_ok=True)
+    paths.weights_dir.mkdir(parents=True, exist_ok=True)
     reports.mkdir(parents=True, exist_ok=True)
     feature_extractor = build_feature_extractor(
         model_name=cfg["model"]["name"],
@@ -600,11 +617,31 @@ def train_from_runtime_config(config: dict[str, Any]) -> AnomalyTrainResult:
     predictor = build_predictor(cfg["model"], feature_extractor).to(device)
     effective_lr, _ = _resolve_effective_lr(cfg["train"])
     optimizer = torch.optim.AdamW(predictor.parameters(), lr=effective_lr, weight_decay=cfg["train"]["weight_decay"])
-    train_rows: list[dict[str, Any]] = []
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+    train_rows = [
+        {key: (int(value) if key == "epoch" else float(value) if key in {"train_loss", "val_loss", "lr", "best_fitness"} else value) for key, value in row.items()}
+        for row in results_csv_rows(paths.results_csv)
+    ]
     best_val = math.inf
-    best_path = checkpoints / "best_predictor.pt"
-    latest_path = checkpoints / "latest_predictor.pt"
-    for epoch in range(1, cfg["train"]["epochs"] + 1):
+    start_epoch = 1
+    global_step = 0
+    resume_path = resolve_resume_path(cfg["train"].get("resume", False), run_dir=output_root)
+    if resume_path is not None:
+        checkpoint = load_checkpoint(resume_path)
+        state_dict = checkpoint.get("model_state") or checkpoint.get("predictor_state") or checkpoint.get("extras", {}).get("predictor_state")
+        if state_dict is None:
+            raise ValueError(f"Checkpoint {resume_path} does not contain predictor weights")
+        predictor.load_state_dict(state_dict)
+        if checkpoint.get("optimizer_state") is not None:
+            optimizer.load_state_dict(checkpoint["optimizer_state"])
+        if checkpoint.get("scheduler_state") is not None:
+            scheduler.load_state_dict(checkpoint["scheduler_state"])
+        start_epoch = int(checkpoint["epoch"]) + 1
+        global_step = int(checkpoint.get("global_step", 0))
+        best_val = float(checkpoint.get("best_fitness", checkpoint.get("best_val_loss", math.inf)))
+    best_path = paths.best
+    last_path = paths.last
+    for epoch in range(start_epoch, cfg["train"]["epochs"] + 1):
         predictor.train()
         train_losses: list[float] = []
         train_bar = _progress(loaders["train_loader"], desc=f"train {epoch}/{cfg['train']['epochs']}", total=len(loaders["train_loader"]))
@@ -616,6 +653,7 @@ def train_from_runtime_config(config: dict[str, Any]) -> AnomalyTrainResult:
             loss.backward()
             optimizer.step()
             train_losses.append(float(loss.item()))
+            global_step += 1
             if tqdm is not None:
                 train_bar.set_postfix(loss=f"{train_losses[-1]:.5f}")
         predictor.eval()
@@ -629,19 +667,38 @@ def train_from_runtime_config(config: dict[str, Any]) -> AnomalyTrainResult:
                 val_losses.append(val_loss_value)
                 if tqdm is not None:
                     val_bar.set_postfix(loss=f"{val_loss_value:.5f}")
+        scheduler.step()
         train_loss = float(np.mean(train_losses))
         val_loss = float(np.mean(val_losses))
-        train_rows.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss, "effective_lr": effective_lr})
-        latest_payload = _checkpoint_payload(predictor, cfg, epoch=epoch, train_loss=train_loss, val_loss=val_loss, best_val_loss=min(best_val, val_loss), effective_lr=effective_lr, checkpoint_kind="latest")
-        torch.save(latest_payload, latest_path)
-        if val_loss < best_val:
-            best_val = val_loss
-            best_payload = _checkpoint_payload(predictor, cfg, epoch=epoch, train_loss=train_loss, val_loss=val_loss, best_val_loss=best_val, effective_lr=effective_lr, checkpoint_kind="best")
-            torch.save(best_payload, best_path)
+        previous_best = best_val
+        best_val = min(best_val, val_loss)
+        train_rows.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss, "lr": float(optimizer.param_groups[0]["lr"]), "best_fitness": best_val})
+        write_results_csv(paths.results_csv, train_rows)
+        if cfg["train"]["save"]:
+            latest_payload = _checkpoint_payload(predictor, cfg, epoch=epoch, train_loss=train_loss, val_loss=val_loss, best_val_loss=best_val, effective_lr=effective_lr, checkpoint_kind="last")
+            latest_payload["optimizer_state"] = optimizer.state_dict()
+            latest_payload["scheduler_state"] = scheduler.state_dict()
+            latest_payload["global_step"] = global_step
+            latest_payload["best_fitness"] = best_val
+            save_checkpoint(latest_payload, last_path)
+            if val_loss <= previous_best:
+                best_payload = _checkpoint_payload(predictor, cfg, epoch=epoch, train_loss=train_loss, val_loss=val_loss, best_val_loss=best_val, effective_lr=effective_lr, checkpoint_kind="best")
+                best_payload["optimizer_state"] = optimizer.state_dict()
+                best_payload["scheduler_state"] = scheduler.state_dict()
+                best_payload["global_step"] = global_step
+                best_payload["best_fitness"] = best_val
+                save_checkpoint(best_payload, best_path)
+            if int(cfg["train"].get("save_period", 0)) > 0 and epoch % int(cfg["train"]["save_period"]) == 0:
+                epoch_payload = _checkpoint_payload(predictor, cfg, epoch=epoch, train_loss=train_loss, val_loss=val_loss, best_val_loss=best_val, effective_lr=effective_lr, checkpoint_kind="epoch")
+                epoch_payload["optimizer_state"] = optimizer.state_dict()
+                epoch_payload["scheduler_state"] = scheduler.state_dict()
+                epoch_payload["global_step"] = global_step
+                epoch_payload["best_fitness"] = best_val
+                save_checkpoint(epoch_payload, paths.weights_dir / f"epoch_{epoch:03d}.pt")
     _write_csv(reports / "train_log.csv", train_rows)
-    summary = {"best_val_loss": best_val, "best_checkpoint": str(best_path), "latest_checkpoint": str(latest_path), "effective_lr": effective_lr}
+    summary = {"best_val_loss": best_val, "best_checkpoint": str(best_path), "last_checkpoint": str(last_path), "effective_lr": effective_lr, "run_dir": str(output_root)}
     _write_json(reports / "train_summary.json", summary)
-    return AnomalyTrainResult(best_val_loss=best_val, best_checkpoint=str(best_path), latest_checkpoint=str(latest_path))
+    return AnomalyTrainResult(best_val_loss=best_val, best_checkpoint=str(best_path), last_checkpoint=str(last_path), run_dir=str(output_root))
 
 
 def _run_eval(config: dict[str, Any], *, split: str) -> tuple[dict[str, Any], Path]:
@@ -664,8 +721,8 @@ def _run_eval(config: dict[str, Any], *, split: str) -> tuple[dict[str, Any], Pa
     )
     predictor = build_predictor(cfg["model"], feature_extractor).to(device)
     checkpoint_path = _resolve_checkpoint_path(cfg, "eval")
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    predictor.load_state_dict(checkpoint["predictor_state"])
+    checkpoint = load_checkpoint(checkpoint_path)
+    predictor.load_state_dict(checkpoint.get("model_state") or checkpoint.get("predictor_state") or checkpoint.get("extras", {}).get("predictor_state"))
     predictor.eval()
     summary = _aggregate_scores(
         loaders["val_loader"] if split == "val" else loaders["test_loader"],
@@ -736,8 +793,8 @@ def export_from_runtime_config(config: dict[str, Any]) -> AnomalyExportResult:
     )
     predictor = build_predictor(cfg["model"], feature_extractor).to(device)
     checkpoint_path = _resolve_checkpoint_path(cfg, "export")
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    predictor.load_state_dict(checkpoint["predictor_state"])
+    checkpoint = load_checkpoint(checkpoint_path)
+    predictor.load_state_dict(checkpoint.get("model_state") or checkpoint.get("predictor_state") or checkpoint.get("extras", {}).get("predictor_state"))
     predictor.eval()
     wrapper = _InferenceWrapper(feature_extractor, predictor, cfg["model"]).to(device)
     wrapper.eval()

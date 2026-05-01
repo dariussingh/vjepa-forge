@@ -116,7 +116,8 @@ def test_read_video_clip_routes_nonzero_offsets_to_dali_when_requested(monkeypat
     assert tuple(clip.shape) == (4, 3, 16, 16)
 
 
-def test_explicit_dali_backend_errors_cleanly_when_unavailable():
+def test_explicit_dali_backend_errors_cleanly_when_unavailable(monkeypatch):
+    monkeypatch.setattr(video_mod, "_has_dali", lambda: False)
     try:
         video_mod.read_video_clip("clip.mp4", clip_start=3, clip_len=4, video_backend="dali")
     except RuntimeError as exc:

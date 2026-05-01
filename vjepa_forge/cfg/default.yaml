@@ -24,6 +24,12 @@ data:
 train:
   epochs: 1
   batch_size: 2
+  save: true
+  save_period: 0
+  resume: false
+  project: outputs/vjepa-forge
+  name: null
+  exist_ok: false
   num_workers: 0
   prefetch_factor: 2
   persistent_workers: true
@@ -62,4 +68,4 @@ export:
   checkpoint_target: best
   checkpoint_path: null
 output:
-  root: outputs/vjepa-forge/anomaly
+  root: outputs/vjepa-forge

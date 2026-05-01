@@ -65,7 +65,19 @@ def main() -> None:
     runtime_data["image_size"] = int(runtime_data.get("image_size", model_cfg.get("image_size", 384)))
     forge_model = ForgeModel(model_cfg, data=runtime_data)
     if action == "train":
-        result = forge_model.train(data=config["data"]["_path"], epochs=int(config["train"].get("epochs", 1)), batch_size=int(config["train"].get("batch_size", 2)), num_workers=int(config["train"].get("num_workers", 0)), device=str(config["train"].get("device", "cpu")))
+        result = forge_model.train(
+            data=config["data"]["_path"],
+            epochs=int(config["train"].get("epochs", 1)),
+            batch_size=int(config["train"].get("batch_size", 2)),
+            num_workers=int(config["train"].get("num_workers", 0)),
+            device=str(config["train"].get("device", "cpu")),
+            save=bool(config["train"].get("save", True)),
+            save_period=int(config["train"].get("save_period", 0)),
+            resume=config["train"].get("resume", False),
+            project=config["train"].get("project"),
+            name=config["train"].get("name"),
+            exist_ok=bool(config["train"].get("exist_ok", False)),
+        )
     elif action == "val":
         result = forge_model.val(data=config["data"]["_path"], batch_size=int(config["val"].get("batch_size", 2)), num_workers=int(config["val"].get("num_workers", 0)), device=str(config["train"].get("device", "cpu")), split=str(config["val"].get("split", "val")))
     elif action == "predict":
