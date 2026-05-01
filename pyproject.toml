@@ -26,6 +26,7 @@ dev = ["pytest"]
 
 [project.scripts]
 vjepa-forge = "vjepa_forge.cli.main:main"
+forge = "vjepa_forge.cli.main:main"
 
 [tool.setuptools]
 include-package-data = true

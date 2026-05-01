@@ -1,208 +1,56 @@
 # vjepa-forge
 
-<p align="center">
-  <strong>Forge image and video downstream models from V-JEPA 2.1.</strong>
-</p>
+Canonical image/video training framework for V-JEPA 2.1-style downstream tasks.
 
-<p align="center">
-  Train, validate, run inference, benchmark, and export image and video models from one CLI.
-</p>
-
-<p align="center">
-  <a href="#install">Install</a> |
-  <a href="#supported-tasks">Supported Tasks</a> |
-  <a href="#getting-started">Getting Started</a> |
-  <a href="#training">Training</a> |
-  <a href="#validation">Validation</a> |
-  <a href="#inference">Inference</a> |
-  <a href="#export">Export</a> |
-  <a href="#datasets">Datasets</a> |
-  <a href="#configs">Configs</a>
-</p>
-
-## Install
+## CLI
 
 ```bash
-git clone git@github.com:dariussingh/vjepa-forge.git
-cd vjepa-forge
-python -m pip install -e .
+forge classify train model=vjepa21-b.yaml data=kinetics400.yaml
+forge detect train model=vjepa21-rfdetr.yaml data=coco.yaml
+forge segment train model=vjepa21-vos.yaml data=davis.yaml
+forge anomaly train model=vjepa21-predictor.yaml data=ucsd_ped2.yaml
 ```
 
-Optional extras:
+Converters are the only place external dataset formats belong:
 
 ```bash
-python -m pip install -e .[detection,onnx]
+forge convert coco source=/data/coco out=/data/coco_forge task=detect media=image
+forge convert kinetics source=/data/kinetics out=/data/kinetics_forge task=classify media=video
 ```
 
-## Supported Tasks
+## Dataset Format
 
-| Task | Input | Support |
-| --- | --- | --- |
-| Classification | Image, Video | Train, val, predict, export |
-| Detection | Image, Video | Train, val, predict |
-| Segmentation | Image | Train, val, predict |
-| Anomaly Detection | Video | Train, val, predict |
+Each dataset is described by a `forge.yaml` file with one `task` and one `media`:
 
-## Getting Started
-
-If you already keep datasets and checkpoints outside this repo:
-
-```bash
-ln -s ../data data
-ln -s ../weights weights
+```yaml
+path: /data/my_dataset
+task: detect
+media: image
+names:
+  0: person
+splits:
+  train: splits/train.txt
+  val: splits/val.txt
+labels:
+  format: forge-yolo
+  root: labels
 ```
 
-Smoke benchmark:
+Image runs use `x: [B, C, H, W]`. Video runs use `x: [B, T, C, H, W]`.
 
-```bash
-vjepa-forge benchmark \
-  config=vjepa_forge/configs/classification/imagenet1k_vitb.yaml \
-  data.image_size=64
+Video annotations may be frame-aware, but model execution is always clip-level.
+
+## Python API
+
+```python
+from vjepa_forge import ForgeModel
+
+model = ForgeModel("vjepa21-rfdetr.yaml", data={"task": "detect", "media": "image", "image_size": 64})
 ```
 
-## Training
+## Notes
 
-```bash
-vjepa-forge train \
-  config=vjepa_forge/configs/classification/imagenet1k_vitb.yaml
-```
-
-Use the same command pattern with any other config file under `vjepa_forge/configs/`.
-
-## Validation
-
-```bash
-vjepa-forge val \
-  config=vjepa_forge/configs/classification/imagenet1k_vitb.yaml
-```
-
-## Inference
-
-```bash
-vjepa-forge predict \
-  config=vjepa_forge/configs/classification/imagenet1k_vitb.yaml
-```
-
-ONNX Runtime inference:
-
-```bash
-vjepa-forge predict \
-  config=vjepa_forge/configs/classification/imagenet1k_vitb.yaml \
-  inference.backend=onnx \
-  export.output_path=classification.onnx
-```
-
-## Export
-
-```bash
-vjepa-forge export \
-  config=vjepa_forge/configs/classification/imagenet1k_vitb.yaml \
-  export.output_path=classification.onnx
-```
-
-## CLI Overrides
-
-Override any config value directly from the command line:
-
-```bash
-vjepa-forge train \
-  config=vjepa_forge/configs/classification/kinetics400_vitb.yaml \
-  data.image_size=224 \
-  data.num_frames=8 \
-  train.epochs=10
-```
-
-## Datasets
-
-`vjepa-forge` expects datasets under `data/` and checkpoints under `weights/`.
-
-Default dataset roots used by the shipped configs:
-
-- ImageNet-1K: `data/imagenet1k`
-- Kinetics-400: `data/kinetics400`
-- COCO detection / instance segmentation: `data/coco`
-- ImageNet VID: `data/imagenet_vid`
-- ADE20K: `data/ade20k`
-- UCSD Ped2 anomaly: `data/ucsd_ped2`
-
-ImageNet VID layout:
-
-```text
-data/imagenet_vid/
-  Data/
-    VID/
-      train/
-      val/
-  Annotations/
-    VID/
-      train/
-      val/
-```
-
-ImageNet-1K layout:
-
-```text
-data/imagenet1k/
-  train/<class_name>/*.jpg
-  val/<class_name>/*.jpg
-```
-
-Kinetics-400 layout:
-
-```text
-data/kinetics400/
-  train/<class_name>/*.mp4
-  val/<class_name>/*.mp4
-```
-
-COCO layout:
-
-```text
-data/coco/
-  images/
-    train2017/
-    val2017/
-  annotations/
-    instances_train2017.json
-    instances_val2017.json
-```
-
-ADE20K layout:
-
-```text
-data/ade20k/
-  images/
-    training/
-    validation/
-  annotations/
-    training/
-    validation/
-```
-
-Helper scripts:
-
-```bash
-./scripts/download_imagenet_vid.sh
-./scripts/download_coco_det.sh
-./scripts/download_ucsd_ped2.sh
-./scripts/download_cuhk_avenue.sh
-./scripts/download_vjepa_weights.sh
-```
-
-## Configs
-
-Available configs:
-
-- `vjepa_forge/configs/classification/imagenet1k_vitb.yaml`
-- `vjepa_forge/configs/classification/kinetics400_vitb.yaml`
-- `vjepa_forge/configs/detection/coco_rf_detr.yaml`
-- `vjepa_forge/configs/detection/imagenet_vid_temporal_detr.yaml`
-- `vjepa_forge/configs/segmentation/ade20k_semantic.yaml`
-- `vjepa_forge/configs/segmentation/coco_instance.yaml`
-- `vjepa_forge/configs/anomaly/ucsd_ped2_predictor.yaml`
-
-## License
-
-This repository is released under the MIT License.
-
-Some copied or adapted upstream components are covered by their original notices. See [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md).
+- `media` is only `image` or `video`
+- there is no mixed-media dataset type
+- runtime parsing uses one canonical Forge text-label parser
+- dataset-specific runtime loaders are replaced by converters plus task/media loaders

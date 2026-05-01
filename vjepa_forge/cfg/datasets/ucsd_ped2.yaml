@@ -1,0 +1,11 @@
+path: data/ucsd_ped2_forge
+task: anomaly
+media: video
+names:
+  0: abnormal
+splits:
+  train: splits/train.txt
+  val: splits/val.txt
+labels:
+  format: forge-yolo
+  root: labels

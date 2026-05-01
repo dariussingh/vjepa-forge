@@ -1,6 +1,6 @@
 name: vjepa21_imagenet1k_vitb
-task: classification
-input_type: image
+task: classify
+media: image
 references:
   backbone: [vjepa2_1]
   dense_features: [dinov3]

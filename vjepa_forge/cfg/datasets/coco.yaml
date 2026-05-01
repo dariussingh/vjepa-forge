@@ -1,0 +1,11 @@
+path: data/coco_forge
+task: detect
+media: image
+names:
+  0: object
+splits:
+  train: splits/train.txt
+  val: splits/val.txt
+labels:
+  format: forge-yolo
+  root: labels

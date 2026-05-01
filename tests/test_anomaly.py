@@ -1,26 +1,45 @@
 import torch
 
-from vjepa_forge.heads.anomaly.modeling import ExtractedFeatures, build_predictor
+from vjepa_forge.data.batching import ForgeBatch
+from vjepa_forge.engine.model import ForgeModel
 
 
-def test_build_predictor_vit_patch_and_score_shape():
-    class StubExtractor:
-        embed_dim = 768
-        grid_depth = 4
-        grid_size = 2
-        tubelet_size = 2
-
-    predictor = build_predictor(
+def test_anomaly_head_emits_binary_scores_for_image_and_video():
+    image_model = ForgeModel(
         {
-            "predictor_type": "vit_patch",
-            "predictor_embed_dim": 768,
-            "predictor_depth": 1,
-            "predictor_num_heads": 12,
-            "dropout": 0.1,
-            "predictor_use_rope": False,
+            "task": "anomaly",
+            "media": "image",
+            "backbone": {"name": "vit_base", "use_sdpa": False, "modality_embedding": False},
+            "image_size": 64,
         },
-        StubExtractor(),
+        data={"task": "anomaly", "media": "image", "image_size": 64},
     )
-    past = ExtractedFeatures(pooled=torch.randn(2, 768), tokens=torch.randn(2, 4, 4, 768))
-    out = predictor(past.tokens)
-    assert out.shape == (2, 4, 4, 768)
+    image_batch = ForgeBatch(
+        x=torch.randn(2, 3, 64, 64),
+        media="image",
+        task="anomaly",
+        labels={"targets": torch.tensor([0.0, 1.0])},
+        paths=[],
+        meta=[],
+    )
+    assert image_model(image_batch).shape == (2,)
+
+    video_model = ForgeModel(
+        {
+            "task": "anomaly",
+            "media": "video",
+            "backbone": {"name": "vit_base", "use_sdpa": False, "modality_embedding": False},
+            "image_size": 64,
+            "num_frames": 4,
+        },
+        data={"task": "anomaly", "media": "video", "image_size": 64, "clip_len": 4},
+    )
+    video_batch = ForgeBatch(
+        x=torch.randn(2, 4, 3, 64, 64),
+        media="video",
+        task="anomaly",
+        labels={"targets": torch.tensor([0.0, 1.0])},
+        paths=[],
+        meta=[],
+    )
+    assert video_model(video_batch).shape == (2,)

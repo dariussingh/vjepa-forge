@@ -1,6 +1,6 @@
 name: vjepa21_ped2_predictor
 task: anomaly
-input_type: video
+media: video
 references:
   backbone: [vjepa2_1]
   dense_features: [dinov3]

@@ -1,6 +1,6 @@
 name: vjepa21_semantic_ade20k
 task: segmentation
-input_type: image
+media: image
 segmentation_type: semantic
 references:
   backbone: [vjepa2_1]

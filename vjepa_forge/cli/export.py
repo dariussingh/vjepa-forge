@@ -9,14 +9,14 @@ from vjepa_forge.export import export_to_onnx
 
 def main() -> None:
     _, _, config = parse_config_args("Export a vjepa-forge model.")
-    if config["task"] == "detection" and config.get("input_type", "image") == "video":
+    if config["task"] == "detect" and config.get("media", "image") == "video":
         raise SystemExit("Video detection ONNX export is not supported yet. Use backend=torch for temporal detection inference.")
     model = build_model(config)
-    input_type = config.get("input_type", "image")
+    media_type = config.get("media", "image")
     image_size = int(config["data"].get("image_size", 384))
     num_frames = int(config["data"].get("num_frames", 8))
     sample = torch.randn(1, 3, image_size, image_size)
-    if input_type == "video":
+    if media_type == "video":
         sample = torch.randn(1, 3, num_frames, image_size, image_size)
     output_path = config.get("export", {}).get("output_path") or f"{config['task']}.onnx"
     print(

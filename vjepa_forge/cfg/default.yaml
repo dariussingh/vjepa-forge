@@ -1,0 +1,32 @@
+task: classify
+mode: train
+media: image
+model:
+  name: vjepa21-b
+  backbone:
+    name: vit_base
+    checkpoint: null
+    checkpoint_key: ema_encoder
+    use_sdpa: false
+    modality_embedding: false
+  head:
+    name: classify
+  num_classes: 2
+data:
+  path: data
+  task: classify
+  media: image
+train:
+  epochs: 1
+  batch_size: 2
+  num_workers: 0
+  device: cpu
+  lr: 0.0001
+  weight_decay: 0.0001
+val:
+  batch_size: 2
+  num_workers: 0
+predict:
+  source: null
+export:
+  format: onnx

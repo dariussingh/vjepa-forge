@@ -1,0 +1,11 @@
+path: data/kinetics400_forge
+task: classify
+media: video
+names:
+  0: class0
+splits:
+  train: splits/train.txt
+  val: splits/val.txt
+labels:
+  format: forge-yolo
+  root: labels

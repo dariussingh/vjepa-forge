@@ -1,0 +1,10 @@
+name: vjepa21-predictor
+backbone:
+  name: vit_base
+  checkpoint: null
+  checkpoint_key: ema_encoder
+  use_sdpa: false
+  modality_embedding: false
+head:
+  name: anomaly
+num_classes: 2

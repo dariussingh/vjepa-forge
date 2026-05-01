@@ -1,0 +1,13 @@
+path: data/davis_forge
+task: segment
+media: video
+names:
+  0: object
+splits:
+  train: splits/train.txt
+  val: splits/val.txt
+labels:
+  format: forge-yolo
+  root: labels
+masks:
+  root: masks

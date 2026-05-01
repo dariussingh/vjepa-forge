@@ -1,5 +1,5 @@
-task: classification
-input_type: image
+task: classify
+media: image
 references:
   backbone: [vjepa, vjepa2, vjepa2_1]
   dense_features: [dinov3]
@@ -13,7 +13,7 @@ model:
     checkpoint: null
     checkpoint_key: ema_encoder
     freeze: false
-    input_type: image_video
+    media: image
     output_layers: [2, 5, 8, 11]
     dense_features: true
     temporal_features: true

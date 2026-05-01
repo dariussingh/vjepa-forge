@@ -10,10 +10,10 @@ from vjepa_forge.engine.trainer import build_model
 def main() -> None:
     _, _, config = parse_config_args("Run prediction with vjepa-forge.")
     backend = config.get("inference", {}).get("backend", "torch")
-    input_type = config.get("input_type", "image")
+    media_type = config.get("media", "image")
     image_size = int(config["data"].get("image_size", 384))
     num_frames = int(config["data"].get("num_frames", 8))
-    if input_type == "video":
+    if media_type == "video":
         batch = torch.randn(1, 3, num_frames, image_size, image_size)
     else:
         batch = torch.randn(1, 3, image_size, image_size)

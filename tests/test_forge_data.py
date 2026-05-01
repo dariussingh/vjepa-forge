@@ -1,0 +1,93 @@
+from pathlib import Path
+
+import torch
+from PIL import Image
+
+from vjepa_forge.data import AnomalyLoader, ClassifyLoader, DetectLoader, ForgeDataset, ForgeLabelParser, SegmentLoader
+
+
+def _write_image(path: Path) -> None:
+    image = Image.new("RGB", (32, 32), color=(128, 64, 32))
+    image.save(path)
+
+
+def _make_dataset(root: Path, *, media: str, task: str, label_lines: list[str]) -> Path:
+    (root / "images" / "train").mkdir(parents=True, exist_ok=True)
+    (root / "videos" / "train").mkdir(parents=True, exist_ok=True)
+    (root / "labels" / "train").mkdir(parents=True, exist_ok=True)
+    (root / "splits").mkdir(parents=True, exist_ok=True)
+    if media == "image":
+        rel = "images/train/sample.jpg"
+        _write_image(root / rel)
+    else:
+        rel = "videos/train/sample.pt"
+        torch.save(torch.randn(4, 3, 32, 32), root / rel)
+    (root / "labels" / "train" / "sample.txt").write_text("\n".join(label_lines), encoding="utf-8")
+    (root / "splits" / "train.txt").write_text(rel + "\n", encoding="utf-8")
+    (root / "splits" / "val.txt").write_text(rel + "\n", encoding="utf-8")
+    yaml_path = root / "forge.yaml"
+    yaml_path.write_text(
+        "\n".join(
+            [
+                f"path: {root}",
+                f"task: {task}",
+                f"media: {media}",
+                "names:",
+                "  0: sample",
+                "splits:",
+                "  train: splits/train.txt",
+                "  val: splits/val.txt",
+                "labels:",
+                "  format: forge-yolo",
+                "  root: labels",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return yaml_path
+
+
+def test_parser_understands_image_and_video_ops():
+    parser = ForgeLabelParser()
+    assert parser.parse_line("cls 3 7 9", media="image", task="classify").payload["class_ids"] == [3, 7, 9]
+    assert parser.parse_line("det 0 1 0.5 0.5 0.2 0.2", media="video", task="detect").payload["frame_idx"] == 0
+    assert parser.parse_line("seg 0 0 17 0.1 0.2 0.3 0.4", media="video", task="segment").payload["object_id"] == 17
+    assert parser.parse_line("ano abnormal 2 4 1", media="video", task="anomaly").payload["class_id"] == 1
+
+
+def test_forge_dataset_and_loaders_build_expected_batch_shapes(tmp_path: Path):
+    image_yaml = _make_dataset(tmp_path / "image_cls", media="image", task="classify", label_lines=["cls 0"])
+    image_dataset = ForgeDataset(image_yaml, split="train")
+    image_batch = ClassifyLoader("image").collate([image_dataset[0]])
+    assert image_batch.x.shape == (1, 3, 32, 32)
+
+    video_yaml = _make_dataset(
+        tmp_path / "video_detect",
+        media="video",
+        task="detect",
+        label_lines=["det 0 0 0.5 0.5 0.2 0.2", "det 1 0 0.5 0.5 0.2 0.2"],
+    )
+    video_dataset = ForgeDataset(video_yaml, split="train")
+    video_batch = DetectLoader("video", clip_len=4).collate([video_dataset[0]])
+    assert video_batch.x.shape == (1, 4, 3, 32, 32)
+    assert len(video_batch.labels["detections"][0]["detections"]) == 2
+
+    seg_yaml = _make_dataset(
+        tmp_path / "video_seg",
+        media="video",
+        task="segment",
+        label_lines=["seg 0 0 17 0.1 0.2 0.3 0.4"],
+    )
+    seg_dataset = ForgeDataset(seg_yaml, split="train")
+    seg_batch = SegmentLoader("video", clip_len=4).collate([seg_dataset[0]])
+    assert seg_batch.x.shape == (1, 4, 3, 32, 32)
+
+    ano_yaml = _make_dataset(
+        tmp_path / "image_ano",
+        media="image",
+        task="anomaly",
+        label_lines=["ano abnormal 0"],
+    )
+    ano_dataset = ForgeDataset(ano_yaml, split="train")
+    ano_batch = AnomalyLoader("image").collate([ano_dataset[0]])
+    assert ano_batch.labels["targets"].tolist() == [1.0]

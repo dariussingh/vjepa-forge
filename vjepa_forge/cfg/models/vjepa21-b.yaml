@@ -1,0 +1,8 @@
+name: vjepa21-b
+backbone:
+  name: vit_base
+  checkpoint: null
+  checkpoint_key: ema_encoder
+  use_sdpa: false
+  modality_embedding: false
+num_classes: 1000

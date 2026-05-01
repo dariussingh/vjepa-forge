@@ -1,0 +1,12 @@
+name: vjepa21-rfdetr
+backbone:
+  name: vit_base
+  checkpoint: null
+  checkpoint_key: ema_encoder
+  use_sdpa: false
+  modality_embedding: false
+head:
+  name: detect
+  num_queries: 100
+  hidden_dim: 256
+num_classes: 80

@@ -1,6 +1,6 @@
 name: vjepa21_rf_detr_coco
 task: detection
-input_type: image
+media: image
 references:
   backbone: [vjepa2_1]
   dense_features: [dinov3]

@@ -1,6 +1,6 @@
 name: vjepa21_kinetics400_vitb
-task: classification
-input_type: video
+task: classify
+media: video
 references:
   backbone: [vjepa2_1]
   dense_features: [dinov3]
