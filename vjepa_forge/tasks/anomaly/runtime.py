@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import math
+import os
 import random
 from pathlib import Path
 from typing import Any
@@ -66,10 +67,12 @@ class AnomalyExportResult:
 
 
 class ForgeAnomalyWindowDataset(Dataset):
-    def __init__(self, videos: list[VideoClipRecord], windows: list[WindowRecord], image_size: int) -> None:
+    def __init__(self, videos: list[VideoClipRecord], windows: list[WindowRecord], image_size: int, video_backend: str = "auto") -> None:
         self.video_lookup = {video.name: video for video in videos}
         self.windows = windows
         self.image_size = image_size
+        self.reader_cache_size = 4
+        self.video_backend = video_backend
 
     def __len__(self) -> int:
         return len(self.windows)
@@ -77,9 +80,20 @@ class ForgeAnomalyWindowDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, Any]:
         window = self.windows[index]
         record = self.video_lookup[window.video_name]
-        clip = read_video_clip(record.media_path, clip_len=None, image_size=self.image_size)
-        past = clip[list(window.past_indices)].permute(1, 0, 2, 3).contiguous()
-        future = clip[list(window.future_indices)].permute(1, 0, 2, 3).contiguous()
+        past_len = len(window.past_indices)
+        future_len = len(window.future_indices)
+        clip_start = int(window.past_indices[0])
+        clip = read_video_clip(
+            record.media_path,
+            clip_start=clip_start,
+            clip_len=past_len + future_len,
+            stride=1,
+            image_size=self.image_size,
+            reader_cache_size=self.reader_cache_size,
+            video_backend=self.video_backend,
+        )
+        past = clip[:past_len].permute(1, 0, 2, 3).contiguous()
+        future = clip[past_len : past_len + future_len].permute(1, 0, 2, 3).contiguous()
         sample: dict[str, Any] = {
             "past": past,
             "future": future,
@@ -174,6 +188,7 @@ def _build_cfg(config: dict[str, Any], *, action: str) -> dict[str, Any]:
     if not dataset_yaml:
         raise ValueError("Anomaly runtime requires data._path or data.dataset_yaml")
     output_root = config.get("output", {}).get("root")
+    default_workers = max(1, min(8, os.cpu_count() or 1))
     return {
         "dataset": {
             "dataset_yaml": str(dataset_yaml),
@@ -181,6 +196,7 @@ def _build_cfg(config: dict[str, Any], *, action: str) -> dict[str, Any]:
             "past_frames": int(data_cfg.get("past_frames", data_cfg.get("num_frames", 8))),
             "future_frames": int(data_cfg.get("future_frames", data_cfg.get("num_frames", 8))),
             "stride": int(data_cfg.get("stride", 1)),
+            "video_backend": str(data_cfg.get("video_backend", "auto")),
         },
         "model": {
             "name": str(model_cfg.get("name", "vjepa2_1_vit_base_384")),
@@ -205,7 +221,11 @@ def _build_cfg(config: dict[str, Any], *, action: str) -> dict[str, Any]:
             "reference_lr": float(config["train"].get("reference_lr", config["train"].get("lr", 1.0e-4))),
             "lr_scale_rule": str(config["train"].get("lr_scale_rule", "sqrt")),
             "weight_decay": float(config["train"].get("weight_decay", 1.0e-4)),
-            "num_workers": int(config["train"].get("num_workers", 0)),
+            "num_workers": int(config["train"].get("num_workers", default_workers)),
+            "prefetch_factor": int(config["train"].get("prefetch_factor", 2)),
+            "persistent_workers": bool(config["train"].get("persistent_workers", True)),
+            "pin_memory": bool(config["train"].get("pin_memory", torch.cuda.is_available())),
+            "reader_cache_size": int(config["train"].get("reader_cache_size", 4)),
             "device": str(config["train"].get("device", "cpu")),
             "seed": int(config["train"].get("seed", 7)),
             "save_latest_every_epoch": bool(config["train"].get("save_latest_every_epoch", True)),
@@ -213,7 +233,11 @@ def _build_cfg(config: dict[str, Any], *, action: str) -> dict[str, Any]:
         },
         "eval": {
             "batch_size": int(config["val"].get("batch_size", 1)),
-            "num_workers": int(config["val"].get("num_workers", 0)),
+            "num_workers": int(config["val"].get("num_workers", default_workers)),
+            "prefetch_factor": int(config["val"].get("prefetch_factor", 2)),
+            "persistent_workers": bool(config["val"].get("persistent_workers", True)),
+            "pin_memory": bool(config["val"].get("pin_memory", torch.cuda.is_available())),
+            "reader_cache_size": int(config["val"].get("reader_cache_size", 4)),
             "threshold_std_multiplier": float(config["val"].get("threshold_std_multiplier", 3.0)),
             "smoothing_window": int(config["val"].get("smoothing_window", 9)),
             "checkpoint_target": str(config["val"].get("checkpoint_target", "best")),
@@ -236,7 +260,11 @@ def _build_video_records(dataset_yaml: str | Path, split: str) -> list[VideoClip
     dataset = ForgeDataset(dataset_yaml, split=split)
     records: list[VideoClipRecord] = []
     for record in dataset.records:
-        labels = [0] * get_video_frame_count(record.media_path)
+        labels = [0] * get_video_frame_count(
+            record.media_path,
+            reader_cache_size=4,
+            video_backend="decord",
+        )
         for annotation in record.annotations:
             if annotation.op != "ano":
                 continue
@@ -298,18 +326,46 @@ def _make_loaders(cfg: dict[str, Any], include_test: bool = True) -> dict[str, A
     val_windows = _build_window_records(val_videos, **common)
     test_windows = _build_window_records(test_videos, **common) if include_test else []
     image_size = dataset_cfg["image_size"]
-    train_ds = ForgeAnomalyWindowDataset(train_videos, train_windows, image_size)
-    val_ds = ForgeAnomalyWindowDataset(val_videos, val_windows, image_size)
-    test_ds = ForgeAnomalyWindowDataset(test_videos, test_windows, image_size) if include_test else None
+    video_backend = str(dataset_cfg.get("video_backend", "auto"))
+    train_ds = ForgeAnomalyWindowDataset(train_videos, train_windows, image_size, video_backend=video_backend)
+    val_ds = ForgeAnomalyWindowDataset(val_videos, val_windows, image_size, video_backend=video_backend)
+    test_ds = ForgeAnomalyWindowDataset(test_videos, test_windows, image_size, video_backend=video_backend) if include_test else None
+    train_ds.reader_cache_size = int(cfg["train"]["reader_cache_size"])
+    val_ds.reader_cache_size = int(cfg["eval"]["reader_cache_size"])
+    if test_ds is not None:
+        test_ds.reader_cache_size = int(cfg["eval"]["reader_cache_size"])
+    train_num_workers = int(cfg["train"]["num_workers"])
+    eval_num_workers = int(cfg["eval"]["num_workers"])
+    if video_backend == "dali":
+        train_num_workers = 0
+        eval_num_workers = 0
+    train_loader_kwargs = {
+        "batch_size": cfg["train"]["batch_size"],
+        "shuffle": True,
+        "num_workers": train_num_workers,
+        "pin_memory": bool(cfg["train"]["pin_memory"] and video_backend != "dali"),
+    }
+    eval_loader_kwargs = {
+        "batch_size": cfg["eval"]["batch_size"],
+        "shuffle": False,
+        "num_workers": eval_num_workers,
+        "pin_memory": bool(cfg["eval"]["pin_memory"] and video_backend != "dali"),
+    }
+    if train_num_workers > 0:
+        train_loader_kwargs["persistent_workers"] = bool(cfg["train"]["persistent_workers"])
+        train_loader_kwargs["prefetch_factor"] = int(cfg["train"]["prefetch_factor"])
+    if eval_num_workers > 0:
+        eval_loader_kwargs["persistent_workers"] = bool(cfg["eval"]["persistent_workers"])
+        eval_loader_kwargs["prefetch_factor"] = int(cfg["eval"]["prefetch_factor"])
     loaders: dict[str, Any] = {
         "train_videos": train_videos,
         "val_videos": val_videos,
         "test_videos": test_videos,
-        "train_loader": DataLoader(train_ds, batch_size=cfg["train"]["batch_size"], shuffle=True, num_workers=cfg["train"]["num_workers"], pin_memory=torch.cuda.is_available()),
-        "val_loader": DataLoader(val_ds, batch_size=cfg["eval"]["batch_size"], shuffle=False, num_workers=cfg["eval"]["num_workers"], pin_memory=torch.cuda.is_available()),
+        "train_loader": DataLoader(train_ds, **train_loader_kwargs),
+        "val_loader": DataLoader(val_ds, **eval_loader_kwargs),
     }
     if test_ds is not None:
-        loaders["test_loader"] = DataLoader(test_ds, batch_size=cfg["eval"]["batch_size"], shuffle=False, num_workers=cfg["eval"]["num_workers"], pin_memory=torch.cuda.is_available())
+        loaders["test_loader"] = DataLoader(test_ds, **eval_loader_kwargs)
     return loaders
 
 

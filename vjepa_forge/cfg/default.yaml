@@ -17,6 +17,7 @@ data:
   task: classify
   media: image
   image_size: 384
+  video_backend: auto
   past_frames: 8
   future_frames: 8
   stride: 1
@@ -24,6 +25,10 @@ train:
   epochs: 1
   batch_size: 2
   num_workers: 0
+  prefetch_factor: 2
+  persistent_workers: true
+  pin_memory: true
+  reader_cache_size: 4
   device: cpu
   lr: 0.0001
   weight_decay: 0.0001
@@ -35,6 +40,10 @@ train:
 val:
   batch_size: 2
   num_workers: 0
+  prefetch_factor: 2
+  persistent_workers: true
+  pin_memory: true
+  reader_cache_size: 4
   split: val
   threshold_std_multiplier: 3.0
   smoothing_window: 9

@@ -34,6 +34,8 @@ Optional extras:
 python -m pip install -e .[detection,onnx,dev]
 ```
 
+For GPU-side video decode, install the DALI extra or a matching DALI build for your CUDA version and use `data.video_backend=dali`. Without DALI, the runtime uses the built-in `decord` CPU path.
+
 ## Supported Tasks
 
 | Task | Media | Support |
@@ -60,6 +62,7 @@ You can keep datasets anywhere on disk. Each `data=...` argument points to a For
 - your own `forge.yaml` path
 
 By default, the active runtime resizes media to `384x384` for training, validation, prediction, and export. Override with `data.image_size=<size>` or `image_size=<size>` depending on your command.
+Video datasets default to `data.video_backend=auto`, which uses DALI when available and otherwise falls back to `decord`.
 
 ## Training
 
@@ -95,7 +98,7 @@ Convert Cafe into Forge format first:
 forge convert cafe source=data/cafe out=data/cafe_forge task=anomaly media=video
 ```
 
-The Cafe converter materializes trimmed clip tensors under `data/cafe_forge/videos/` so each Forge record matches its own label interval.
+The Cafe converter materializes trimmed `.mp4` clips under `data/cafe_forge/videos/` so each Forge record matches its own label interval.
 
 ```bash
 forge anomaly train \
@@ -105,6 +108,7 @@ forge anomaly train \
   data.image_size=384 \
   train.epochs=10 \
   train.batch_size=1 \
+  train.num_workers=8 \
   train.device=cuda
 ```
 
@@ -116,6 +120,7 @@ forge classify train \
   data=/data/kinetics_forge/forge.yaml \
   train.epochs=10 \
   train.batch_size=4 \
+  data.video_backend=auto \
   train.device=cpu
 ```
 
@@ -139,6 +144,8 @@ forge anomaly val \
 
 The current Cafe converter writes the same held-out clips to both `val` and `test`.
 Anomaly checkpoints and reports are written under `outputs/vjepa-forge/anomaly/cafe_forge/`.
+For video tasks, decoded clip loading is shared across tasks and can be tuned with `train.num_workers`, `train.prefetch_factor`, `train.persistent_workers`, and `train.reader_cache_size`.
+To force GPU-side decode, set `data.video_backend=dali`. The DALI path uses DALI experimental video decode APIs so anomaly sliding windows and other nonzero-offset clip reads work through the same backend.
 
 ## Inference
 

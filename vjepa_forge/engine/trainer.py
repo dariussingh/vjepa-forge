@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 
 import torch
@@ -39,15 +40,37 @@ class BaseTrainer:
         clip_len = int(self.model.data_cfg.get("clip_len", self.model.data_cfg.get("num_frames", 8)))
         clip_stride = int(self.model.data_cfg.get("clip_stride", 1))
         image_size = int(self.model.data_cfg.get("image_size", 384))
+        reader_cache_size = int(self.model.data_cfg.get("reader_cache_size", 4))
+        video_backend = str(self.model.data_cfg.get("video_backend", "auto"))
         if dataset.task == "classify":
-            collator = ClassifyLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size)
+            collator = ClassifyLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size, reader_cache_size=reader_cache_size, video_backend=video_backend)
         elif dataset.task == "detect":
-            collator = DetectLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size)
+            collator = DetectLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size, reader_cache_size=reader_cache_size, video_backend=video_backend)
         elif dataset.task == "segment":
-            collator = SegmentLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size)
+            collator = SegmentLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size, reader_cache_size=reader_cache_size, video_backend=video_backend)
         else:
-            collator = AnomalyLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size)
-        return DataLoader(dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, collate_fn=collator.collate)
+            collator = AnomalyLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size, reader_cache_size=reader_cache_size, video_backend=video_backend)
+        worker_count = int(self.num_workers)
+        if dataset.media == "video" and video_backend == "dali":
+            worker_count = 0
+        if worker_count <= 0 and dataset.media == "video":
+            if video_backend != "dali":
+                worker_count = max(1, min(8, os.cpu_count() or 1))
+        pin_memory = bool(self.model.data_cfg.get("pin_memory", torch.cuda.is_available() and video_backend != "dali"))
+        persistent_workers = bool(self.model.data_cfg.get("persistent_workers", dataset.media == "video" and worker_count > 0))
+        prefetch_factor = self.model.data_cfg.get("prefetch_factor", 2 if dataset.media == "video" and worker_count > 0 else None)
+        loader_kwargs = {
+            "batch_size": self.batch_size,
+            "shuffle": False,
+            "num_workers": worker_count,
+            "collate_fn": collator.collate,
+            "pin_memory": pin_memory,
+        }
+        if worker_count > 0:
+            loader_kwargs["persistent_workers"] = persistent_workers
+            if prefetch_factor is not None:
+                loader_kwargs["prefetch_factor"] = int(prefetch_factor)
+        return DataLoader(dataset, **loader_kwargs)
 
     def progress(self, iterable, *, desc: str, total: int | None = None):
         if tqdm is None:

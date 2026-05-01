@@ -21,6 +21,7 @@ dependencies = [
 
 [project.optional-dependencies]
 detection = ["ultralytics", "faster-coco-eval", "scipy"]
+dali = ["nvidia-dali-cuda120>=1.50; platform_system == 'Linux'"]
 onnx = ["onnx", "onnxruntime"]
 dev = ["pytest"]
 
