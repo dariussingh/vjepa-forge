@@ -240,13 +240,6 @@ model = ForgeModel(
 )
 ```
 
-## Notes
-
-- A run is always single-media: image or video.
-- Video labels may be frame-aware, but model execution is clip-level.
-- Mixed image+video pretraining is not a dataset type.
-- The canonical runtime parser is text-based; JSON labels are not used.
-
 ## License
 
 This repository is released under the MIT License.
