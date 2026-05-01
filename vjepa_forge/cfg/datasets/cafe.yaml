@@ -1,0 +1,12 @@
+path: data/cafe_forge
+task: anomaly
+media: video
+names:
+  0: anomaly
+splits:
+  train: splits/train.txt
+  val: splits/val.txt
+  test: splits/test.txt
+labels:
+  format: forge-yolo
+  root: labels

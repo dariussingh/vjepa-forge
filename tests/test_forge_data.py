@@ -3,7 +3,7 @@ from pathlib import Path
 import torch
 from PIL import Image
 
-from vjepa_forge.data import AnomalyLoader, ClassifyLoader, DetectLoader, ForgeDataset, ForgeLabelParser, SegmentLoader
+from vjepa_forge.data import AnomalyLoader, ClassifyLoader, DetectLoader, ForgeDataset, ForgeLabelParser, SegmentLoader, convert_cafe_to_forge
 
 
 def _write_image(path: Path) -> None:
@@ -91,3 +91,28 @@ def test_forge_dataset_and_loaders_build_expected_batch_shapes(tmp_path: Path):
     ano_dataset = ForgeDataset(ano_yaml, split="train")
     ano_batch = AnomalyLoader("image").collate([ano_dataset[0]])
     assert ano_batch.labels["targets"].tolist() == [1.0]
+
+
+def test_convert_cafe_to_forge_generates_splits_and_labels(tmp_path: Path):
+    source = tmp_path / "cafe"
+    (source / "normal").mkdir(parents=True, exist_ok=True)
+    (source / "anomaly").mkdir(parents=True, exist_ok=True)
+    (source / "processed").mkdir(parents=True, exist_ok=True)
+    torch.save(torch.randn(4, 3, 32, 32), source / "normal" / "normal_1.pt")
+    torch.save(torch.randn(4, 3, 32, 32), source / "anomaly" / "anomaly_1.pt")
+    (source / "processed" / "clip_manifest.json").write_text(
+        """
+[
+  {"split": "Train", "label": "normal", "clip_name": "train_clip", "source_video": "normal_1.pt", "frame_start": 0, "frame_end": 3, "label_frame_start": null, "label_frame_end": null},
+  {"split": "Test", "label": "anomaly", "clip_name": "test_clip", "source_video": "anomaly_1.pt", "frame_start": 10, "frame_end": 13, "label_frame_start": 11, "label_frame_end": 12}
+]
+        """.strip(),
+        encoding="utf-8",
+    )
+    (source / "processed" / "frame_labels.json").write_text('{"test_clip": [0, 1, 1, 0]}', encoding="utf-8")
+    out = tmp_path / "cafe_forge"
+    result = convert_cafe_to_forge(source, out)
+    assert Path(result.dataset_yaml).exists()
+    assert (out / "splits" / "val.txt").read_text(encoding="utf-8") == (out / "splits" / "test.txt").read_text(encoding="utf-8")
+    assert (out / "labels" / "train" / "train_clip.txt").read_text(encoding="utf-8").strip() == "ano normal"
+    assert (out / "labels" / "test" / "test_clip.txt").read_text(encoding="utf-8").strip() == "ano abnormal 1 2 0"

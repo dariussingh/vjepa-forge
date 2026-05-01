@@ -13,7 +13,7 @@ class VJEPA21Backbone(nn.Module):
     def __init__(self, config: dict) -> None:
         super().__init__()
         backbone_cfg = dict(config.get("backbone", config))
-        image_size = int(config.get("image_size", config.get("imgsz", 64)))
+        image_size = int(config.get("image_size", config.get("imgsz", 384)))
         num_frames = int(config.get("num_frames", 8))
         self.image_tokenizer = VJEPAImageTokenizer()
         self.video_tokenizer = VJEPAVideoTokenizer()

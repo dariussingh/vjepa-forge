@@ -25,3 +25,9 @@ def test_model_and_dataset_cfg_paths_resolve_from_cfg_package():
     config = load_runtime_config(task="classify", mode="train", model="vjepa21-b", data="kinetics400")
     assert Path(config["model"]["_path"]).name == "vjepa21-b.yaml"
     assert Path(config["data"]["_path"]).name == "kinetics400.yaml"
+
+
+def test_cafe_dataset_cfg_is_shipped():
+    config = load_runtime_config(task="anomaly", mode="train", model="vjepa21-predictor.yaml", data="cafe.yaml")
+    assert config["data"]["task"] == "anomaly"
+    assert config["data"]["media"] == "video"

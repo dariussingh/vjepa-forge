@@ -9,6 +9,11 @@ from torch.utils.data import DataLoader
 
 from vjepa_forge.data import AnomalyLoader, ClassifyLoader, DetectLoader, ForgeBatch, ForgeDataset, SegmentLoader
 
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - optional dependency
+    tqdm = None
+
 
 @dataclass
 class TrainResult:
@@ -17,13 +22,14 @@ class TrainResult:
 
 
 class BaseTrainer:
-    def __init__(self, model, *, data: str, epochs: int = 1, batch_size: int = 2, num_workers: int = 0, device: str = "cpu") -> None:
+    def __init__(self, model, *, data: str, epochs: int = 1, batch_size: int = 2, num_workers: int = 0, device: str = "cpu", split: str | None = None) -> None:
         self.model = model
         self.data = data
         self.epochs = epochs
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.device = torch.device(device)
+        self.split = split if split is not None else getattr(self, "split", None)
 
     def build_dataset(self, split: str = "train") -> ForgeDataset:
         return ForgeDataset(self.data, split=split)
@@ -32,15 +38,21 @@ class BaseTrainer:
         dataset = self.build_dataset(split=split)
         clip_len = int(self.model.data_cfg.get("clip_len", self.model.data_cfg.get("num_frames", 8)))
         clip_stride = int(self.model.data_cfg.get("clip_stride", 1))
+        image_size = int(self.model.data_cfg.get("image_size", 384))
         if dataset.task == "classify":
-            collator = ClassifyLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride)
+            collator = ClassifyLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size)
         elif dataset.task == "detect":
-            collator = DetectLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride)
+            collator = DetectLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size)
         elif dataset.task == "segment":
-            collator = SegmentLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride)
+            collator = SegmentLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size)
         else:
-            collator = AnomalyLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride)
+            collator = AnomalyLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size)
         return DataLoader(dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, collate_fn=collator.collate)
+
+    def progress(self, iterable, *, desc: str, total: int | None = None):
+        if tqdm is None:
+            return iterable
+        return tqdm(iterable, desc=desc, total=total, dynamic_ncols=True)
 
     def compute_loss(self, batch: ForgeBatch, outputs) -> torch.Tensor:
         if batch.task == "classify":
@@ -61,8 +73,9 @@ class BaseTrainer:
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-4)
         last_loss = 0.0
         steps = 0
-        for _ in range(self.epochs):
-            for batch in loader:
+        for epoch_idx in range(self.epochs):
+            progress = self.progress(loader, desc=f"train {epoch_idx + 1}/{self.epochs}", total=len(loader))
+            for batch in progress:
                 batch.x = batch.x.to(self.device)
                 optimizer.zero_grad(set_to_none=True)
                 outputs = self.model(batch)
@@ -71,4 +84,6 @@ class BaseTrainer:
                 optimizer.step()
                 last_loss = float(loss.detach().cpu().item())
                 steps += 1
+                if tqdm is not None:
+                    progress.set_postfix(loss=f"{last_loss:.4f}")
         return TrainResult(loss=last_loss, steps=steps)

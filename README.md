@@ -41,7 +41,7 @@ python -m pip install -e .[detection,onnx,dev]
 | Classification | Image, Video | Train, val, predict |
 | Detection | Image, Video | Train, val, predict |
 | Segmentation | Image, Video | Train, val, predict |
-| Anomaly | Image, Video | Train, val, predict |
+| Anomaly | Image, Video | Train, val, predict, export |
 
 ## Getting Started
 
@@ -58,6 +58,8 @@ You can keep datasets anywhere on disk. Each `data=...` argument points to a For
 
 - a shipped dataset config under `vjepa_forge/cfg/datasets/`
 - your own `forge.yaml` path
+
+By default, the active runtime resizes media to `384x384` for training, validation, prediction, and export. Override with `data.image_size=<size>` or `image_size=<size>` depending on your command.
 
 ## Training
 
@@ -85,6 +87,27 @@ Video detection:
 forge detect train model=vjepa21-rfdetr.yaml data=/data/imagenet_vid_forge/forge.yaml
 ```
 
+Cafe anomaly with the predictor-based V-JEPA 2.1 ViT-B path:
+
+Convert Cafe into Forge format first:
+
+```bash
+forge convert cafe source=data/cafe out=data/cafe_forge task=anomaly media=video
+```
+
+The Cafe converter materializes trimmed clip tensors under `data/cafe_forge/videos/` so each Forge record matches its own label interval.
+
+```bash
+forge anomaly train \
+  model=vjepa21-predictor.yaml \
+  data=data/cafe_forge/forge.yaml \
+  model.backbone.checkpoint=weights/vjepa2_1_vitb_dist_vitG_384.pt \
+  data.image_size=384 \
+  train.epochs=10 \
+  train.batch_size=1 \
+  train.device=cuda
+```
+
 Overrides still use `key=value`:
 
 ```bash
@@ -103,11 +126,49 @@ forge classify val model=vjepa21-b.yaml data=/data/imagenet_forge/forge.yaml
 forge detect val model=vjepa21-rfdetr.yaml data=/data/coco_forge/forge.yaml
 ```
 
+Cafe anomaly validation:
+
+```bash
+forge anomaly val \
+  model=vjepa21-predictor.yaml \
+  data=data/cafe_forge/forge.yaml \
+  model.backbone.checkpoint=weights/vjepa2_1_vitb_dist_vitG_384.pt \
+  data.image_size=384 \
+  train.device=cuda
+```
+
+The current Cafe converter writes the same held-out clips to both `val` and `test`.
+Anomaly checkpoints and reports are written under `outputs/vjepa-forge/anomaly/cafe_forge/`.
+
 ## Inference
 
 ```bash
 forge classify predict model=vjepa21-b.yaml data=/data/imagenet_forge/forge.yaml
 forge anomaly predict model=vjepa21-predictor.yaml data=/data/ucsd_forge/forge.yaml
+```
+
+Cafe anomaly prediction on the held-out split:
+
+```bash
+forge anomaly predict \
+  model=vjepa21-predictor.yaml \
+  data=data/cafe_forge/forge.yaml \
+  model.backbone.checkpoint=weights/vjepa2_1_vitb_dist_vitG_384.pt \
+  data.image_size=384 \
+  train.device=cuda
+```
+
+## Export
+
+Anomaly export currently produces ONNX on the active `forge` path:
+
+```bash
+forge anomaly export \
+  model=vjepa21-predictor.yaml \
+  data=data/cafe_forge/forge.yaml \
+  model.backbone.checkpoint=weights/vjepa2_1_vitb_dist_vitG_384.pt \
+  data.image_size=384 \
+  export.output_path=weights/cafe_anomaly_vitb.onnx
 ```
 
 ## Dataset Conversion
@@ -121,6 +182,7 @@ forge convert coco source=/data/coco out=/data/coco_forge task=detect media=imag
 forge convert kinetics source=/data/kinetics out=/data/kinetics_forge task=classify media=video
 forge convert davis source=/data/DAVIS out=/data/davis_forge task=segment media=video
 forge convert ucsd source=/data/UCSDped2 out=/data/ucsd_forge task=anomaly media=video
+forge convert cafe source=data/cafe out=data/cafe_forge task=anomaly media=video
 ```
 
 ## Forge Datasets

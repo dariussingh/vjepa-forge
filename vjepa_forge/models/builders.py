@@ -9,7 +9,7 @@ from .vjepa.model import VJEPA21Backbone
 def build_backbone(model_cfg: dict, data_cfg: dict) -> VJEPA21Backbone:
     merged = {
         "backbone": dict(model_cfg.get("backbone", {})),
-        "image_size": int(model_cfg.get("image_size", data_cfg.get("image_size", 64))),
+        "image_size": int(model_cfg.get("image_size", data_cfg.get("image_size", 384))),
         "num_frames": int(model_cfg.get("num_frames", data_cfg.get("clip_len", data_cfg.get("num_frames", 8)))),
     }
     return VJEPA21Backbone(merged)

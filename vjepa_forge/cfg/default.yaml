@@ -16,6 +16,10 @@ data:
   path: data
   task: classify
   media: image
+  image_size: 384
+  past_frames: 8
+  future_frames: 8
+  stride: 1
 train:
   epochs: 1
   batch_size: 2
@@ -23,10 +27,30 @@ train:
   device: cpu
   lr: 0.0001
   weight_decay: 0.0001
+  lr_mode: manual
+  reference_batch_size: 2
+  reference_lr: 0.0001
+  lr_scale_rule: sqrt
+  seed: 7
 val:
   batch_size: 2
   num_workers: 0
+  split: val
+  threshold_std_multiplier: 3.0
+  smoothing_window: 9
+  checkpoint_target: best
+  checkpoint_path: null
 predict:
   source: null
+  batch_size: 1
+  num_workers: 0
+  split: test
 export:
   format: onnx
+  output_path: anomaly.onnx
+  opset: 17
+  dynamic_axes: true
+  checkpoint_target: best
+  checkpoint_path: null
+output:
+  root: outputs/vjepa-forge/anomaly
