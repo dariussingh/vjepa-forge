@@ -3,10 +3,14 @@ from types import SimpleNamespace
 
 import cv2
 import numpy as np
+import pytest
 import torch
 from PIL import Image
 
+from vjepa_forge.data.batching import ForgeBatch
+from vjepa_forge.engine.checkpointing import load_checkpoint
 from vjepa_forge.engine.model import ForgeModel
+from vjepa_forge.engine.trainer import BaseTrainer
 from vjepa_forge.heads.anomaly.modeling import ExtractedFeatures
 import vjepa_forge.tasks.anomaly.runtime as anomaly_runtime_mod
 import vjepa_forge.tasks.anomaly.predict as anomaly_predict_mod
@@ -107,6 +111,74 @@ def test_forge_model_train_saves_and_resumes_checkpoints(tmp_path: Path):
     rows = (Path(second.run_dir) / "results.csv").read_text(encoding="utf-8").strip().splitlines()
     assert len(rows) == 3
     assert rows[-1].startswith("2,")
+
+
+def test_trainer_skips_missing_validation_split_with_warning(caplog):
+    model = ForgeModel(
+        {
+            "task": "classify",
+            "media": "image",
+            "backbone": {"name": "vit_base", "use_sdpa": False, "modality_embedding": False},
+            "image_size": 32,
+            "num_classes": 2,
+        },
+        data={"task": "classify", "media": "image", "image_size": 32},
+    )
+    trainer = BaseTrainer(model, data="unused", num_workers=0)
+    trainer.build_loader = lambda split="val": (_ for _ in ()).throw(FileNotFoundError("missing val split"))  # type: ignore[method-assign]
+    with caplog.at_level("WARNING"):
+        assert trainer.validate_epoch() is None
+    assert "Skipping validation split" in caplog.text
+
+
+def test_trainer_propagates_unexpected_validation_errors():
+    model = ForgeModel(
+        {
+            "task": "classify",
+            "media": "image",
+            "backbone": {"name": "vit_base", "use_sdpa": False, "modality_embedding": False},
+            "image_size": 32,
+            "num_classes": 2,
+        },
+        data={"task": "classify", "media": "image", "image_size": 32},
+    )
+    trainer = BaseTrainer(model, data="unused", num_workers=0)
+    trainer.build_loader = lambda split="val": (_ for _ in ()).throw(RuntimeError("cuda oom"))  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="cuda oom"):
+        trainer.validate_epoch()
+
+
+def test_detect_and_segment_losses_fail_fast():
+    detect_model = ForgeModel(
+        {
+            "task": "detect",
+            "media": "image",
+            "backbone": {"name": "vit_base", "use_sdpa": False, "modality_embedding": False},
+            "image_size": 64,
+            "num_classes": 5,
+            "head": {"num_queries": 8},
+        },
+        data={"task": "detect", "media": "image", "image_size": 64},
+    )
+    detect_batch = ForgeBatch(x=torch.randn(1, 3, 64, 64), media="image", task="detect", labels={"detections": []}, paths=[], meta=[])
+    detect_trainer = BaseTrainer(detect_model, data="unused", num_workers=0)
+    with pytest.raises(NotImplementedError, match="Detection training/validation loss"):
+        detect_trainer.compute_loss(detect_batch, detect_model(detect_batch))
+
+    segment_model = ForgeModel(
+        {
+            "task": "segment",
+            "media": "image",
+            "backbone": {"name": "vit_base", "use_sdpa": False, "modality_embedding": False},
+            "image_size": 64,
+            "num_classes": 3,
+        },
+        data={"task": "segment", "media": "image", "image_size": 64},
+    )
+    segment_batch = ForgeBatch(x=torch.randn(1, 3, 64, 64), media="image", task="segment", labels={"segments": []}, paths=[], meta=[])
+    segment_trainer = BaseTrainer(segment_model, data="unused", num_workers=0)
+    with pytest.raises(NotImplementedError, match="Segmentation training/validation loss"):
+        segment_trainer.compute_loss(segment_batch, segment_model(segment_batch))
 
 
 def _write_anomaly_dataset(root: Path) -> Path:
@@ -253,6 +325,127 @@ def test_anomaly_runtime_saves_and_resumes_unified_checkpoints(tmp_path: Path, m
     rows = (Path(resumed.run_dir) / "results.csv").read_text(encoding="utf-8").strip().splitlines()
     assert len(rows) == 3
     assert rows[-1].startswith("2,")
+    checkpoint = load_checkpoint(first.last_checkpoint)
+    assert "model_state" in checkpoint
+    assert checkpoint.get("extras", {}).get("effective_lr") is not None
+    assert "predictor_state" not in checkpoint
+    assert "predictor_state" not in checkpoint.get("extras", {})
+
+
+def test_anomaly_runtime_accepts_legacy_predictor_state_checkpoints(tmp_path: Path, monkeypatch):
+    dataset_yaml = _write_anomaly_dataset(tmp_path / "anomaly_legacy")
+
+    class _FakeExtractor(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.tubelet_size = 1
+            self.embed_dim = 3
+            self.grid_depth = 2
+            self.grid_size = 1
+
+        def forward(self, clip: torch.Tensor) -> ExtractedFeatures:
+            pooled = clip.mean(dim=(2, 3, 4))
+            tokens = pooled.unsqueeze(1).unsqueeze(2).repeat(1, clip.shape[2], 1, 1)
+            return ExtractedFeatures(pooled=pooled, tokens=tokens)
+
+    monkeypatch.setattr(anomaly_runtime_mod, "build_feature_extractor", lambda **kwargs: _FakeExtractor())
+    monkeypatch.setattr(
+        anomaly_runtime_mod,
+        "build_predictor",
+        lambda model_cfg, feature_extractor: torch.nn.Linear(feature_extractor.embed_dim, feature_extractor.embed_dim, bias=False),
+    )
+    predictor = torch.nn.Linear(3, 3, bias=False)
+    ckpt = tmp_path / "legacy_predictor.pt"
+    torch.save({"predictor_state": predictor.state_dict()}, ckpt)
+    result = anomaly_runtime_mod.predict_from_runtime_config(
+        {
+            "model": {
+                "name": "vjepa2_1_vit_base_384",
+                "backbone": {"checkpoint": "dummy.pt", "checkpoint_key": "ema_encoder"},
+                "predictor_type": "global_mlp",
+                "hidden_dim": 4,
+                "dropout": 0.0,
+            },
+            "data": {"_path": str(dataset_yaml), "image_size": 32, "past_frames": 2, "future_frames": 2, "stride": 1},
+            "train": {"device": "cpu", "project": str(tmp_path / "runs"), "name": "legacy-ckpt", "exist_ok": True},
+            "val": {"batch_size": 1, "num_workers": 0, "checkpoint_path": str(ckpt)},
+            "predict": {"split": "test", "batch_size": 1, "num_workers": 0},
+            "export": {},
+            "output": {},
+        }
+    )
+    assert result.metrics["predictor_frame_auc"] is not None
+
+
+def test_anomaly_eval_uses_validation_split_for_threshold_calibration(tmp_path: Path, monkeypatch):
+    dataset_yaml = _write_anomaly_dataset(tmp_path / "anomaly_eval")
+
+    class _FakeExtractor(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.tubelet_size = 1
+            self.embed_dim = 3
+            self.grid_depth = 2
+            self.grid_size = 1
+
+        def forward(self, clip: torch.Tensor) -> ExtractedFeatures:
+            pooled = clip.mean(dim=(2, 3, 4))
+            tokens = pooled.unsqueeze(1).unsqueeze(2).repeat(1, clip.shape[2], 1, 1)
+            return ExtractedFeatures(pooled=pooled, tokens=tokens)
+
+    monkeypatch.setattr(anomaly_runtime_mod, "build_feature_extractor", lambda **kwargs: _FakeExtractor())
+    monkeypatch.setattr(
+        anomaly_runtime_mod,
+        "build_predictor",
+        lambda model_cfg, feature_extractor: torch.nn.Linear(feature_extractor.embed_dim, feature_extractor.embed_dim, bias=False),
+    )
+    monkeypatch.setattr(anomaly_runtime_mod, "_make_loaders", lambda cfg, include_test=True: {"val_loader": "val", "test_loader": "test"})
+    monkeypatch.setattr(anomaly_runtime_mod, "load_checkpoint", lambda path: {"model_state": torch.nn.Linear(3, 3, bias=False).state_dict()})
+    monkeypatch.setattr(anomaly_runtime_mod, "_make_output_root", lambda cfg: tmp_path / "runs" / "eval-threshold")
+
+    def _summary(normal_score: float, anomaly_score: float) -> dict[str, object]:
+        return {
+            "videos": {
+                "normal": {
+                    "frame_ids": [0],
+                    "predictor_scores": [normal_score],
+                    "frozen_scores": [normal_score],
+                    "labels": [0],
+                },
+                "anomaly": {
+                    "frame_ids": [0],
+                    "predictor_scores": [anomaly_score],
+                    "frozen_scores": [anomaly_score],
+                    "labels": [1],
+                },
+            }
+        }
+
+    def _fake_aggregate_scores(loader, predictor, feature_extractor, device, desc, model_cfg):
+        if loader == "val":
+            return _summary(0.2, 0.8), {"avg_decode_time": 0.0, "avg_model_time": 0.0}
+        return _summary(0.6, 0.7), {"avg_decode_time": 0.0, "avg_model_time": 0.0}
+
+    monkeypatch.setattr(anomaly_runtime_mod, "_aggregate_scores", _fake_aggregate_scores)
+    result = anomaly_runtime_mod.validate_from_runtime_config(
+        {
+            "model": {
+                "name": "vjepa2_1_vit_base_384",
+                "backbone": {"checkpoint": "dummy.pt", "checkpoint_key": "ema_encoder"},
+                "predictor_type": "global_mlp",
+                "hidden_dim": 4,
+                "dropout": 0.0,
+            },
+            "data": {"_path": str(dataset_yaml), "image_size": 32, "past_frames": 2, "future_frames": 2, "stride": 1},
+            "train": {"device": "cpu", "project": str(tmp_path / "runs"), "name": "eval-threshold", "exist_ok": True},
+            "val": {"split": "test", "batch_size": 1, "num_workers": 0, "checkpoint_path": "dummy.pt", "threshold_std_multiplier": 0.0},
+            "predict": {},
+            "export": {},
+            "output": {},
+        }
+    )
+    assert result.metrics["predictor_threshold"] == pytest.approx(0.2)
+    assert result.metrics["predictor_val_false_positive_rate"] == 0.0
 
 
 def test_anomaly_clip_metrics_include_confusion_matrix():

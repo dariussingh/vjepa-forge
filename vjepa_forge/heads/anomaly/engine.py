@@ -28,6 +28,7 @@ from .dataset import (
 )
 from .modeling import ExtractedFeatures, build_feature_extractor, build_predictor
 from .viz import write_timeline_svg
+from vjepa_forge.utils.checkpoint_loader import robust_checkpoint_loader
 
 
 def _repo_root() -> Path:
@@ -632,8 +633,11 @@ def main_eval(argv: list[str] | None = None) -> None:
     )
     predictor = build_predictor(cfg["model"], feature_extractor).to(device)
     predictor_ckpt = _resolve_eval_checkpoint_path(cfg)
-    checkpoint = torch.load(predictor_ckpt, map_location="cpu")
-    predictor.load_state_dict(checkpoint["predictor_state"])
+    checkpoint = robust_checkpoint_loader(str(predictor_ckpt), map_location="cpu")
+    predictor_state = checkpoint.get("model_state") or checkpoint.get("predictor_state") or checkpoint.get("extras", {}).get("predictor_state")
+    if predictor_state is None:
+        raise ValueError(f"Checkpoint {predictor_ckpt} does not contain predictor weights")
+    predictor.load_state_dict(predictor_state)
     predictor.eval()
     print(
         f"Loaded checkpoint: {predictor_ckpt} "

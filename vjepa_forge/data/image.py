@@ -97,7 +97,6 @@ class _DaliImagePipeline:
 
     def run(self, *, encoded: np.ndarray) -> Any:
         self.pipeline.feed_input("encoded", [encoded])
-        self.pipeline.reset()
         return self.pipeline.run()[0]
 
 

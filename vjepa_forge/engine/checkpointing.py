@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import csv
+import os
 from pathlib import Path
+import tempfile
 from typing import Any
 
 import torch
@@ -70,15 +72,15 @@ def results_csv_rows(path: str | Path) -> list[dict[str, str]]:
 def write_results_csv(path: str | Path, rows: list[dict[str, Any]]) -> None:
     csv_path = Path(path)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
-    if not rows:
-        csv_path.write_text("", encoding="utf-8")
-        return
-    fieldnames = list(rows[0].keys())
-    with csv_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="", dir=csv_path.parent, delete=False) as handle:
+        tmp_path = Path(handle.name)
+        if rows:
+            fieldnames = list(rows[0].keys())
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+    os.replace(tmp_path, csv_path)
 
 
 def checkpoint_payload(
@@ -124,7 +126,7 @@ def save_checkpoint(payload: dict[str, Any], path: str | Path) -> Path:
 
 
 def load_checkpoint(path: str | Path) -> dict[str, Any]:
-    return torch.load(Path(path), map_location="cpu", weights_only=False)
+    return torch.load(Path(path), map_location="cpu", weights_only=True)
 
 
 def resolve_resume_path(resume: bool | str | Path | None, *, run_dir: Path) -> Path | None:

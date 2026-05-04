@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 import torch
 from PIL import Image
 
@@ -7,6 +8,7 @@ import vjepa_forge.data.converters.cafe as cafe_converter
 from vjepa_forge.data import AnomalyLoader, ClassifyLoader, DetectLoader, ForgeDataset, ForgeLabelParser, SegmentLoader, convert_cafe_to_forge
 import vjepa_forge.data.image as image_mod
 import vjepa_forge.data.video as video_mod
+from vjepa_forge.data.forge.validator import resolve_label_path
 
 
 def _write_image(path: Path) -> None:
@@ -94,6 +96,20 @@ def test_forge_dataset_and_loaders_build_expected_batch_shapes(tmp_path: Path):
     ano_dataset = ForgeDataset(ano_yaml, split="train")
     ano_batch = AnomalyLoader("image", image_size=32).collate([ano_dataset[0]])
     assert ano_batch.labels["targets"].tolist() == [1.0]
+
+
+def test_resolve_label_path_supports_two_component_split_paths(tmp_path: Path):
+    dataset_root = tmp_path / "dataset"
+    label_path = resolve_label_path(dataset_root, {"labels": {"root": "labels"}}, "train/sample.mp4")
+    assert label_path == dataset_root / "labels" / "train" / "sample.txt"
+
+
+def test_classify_loader_raises_actionable_error_for_missing_annotations(tmp_path: Path):
+    yaml_path = _make_dataset(tmp_path / "missing_labels", media="image", task="classify", label_lines=["cls 0"])
+    (tmp_path / "missing_labels" / "labels" / "train" / "sample.txt").unlink()
+    dataset = ForgeDataset(yaml_path, split="train")
+    with pytest.raises(ValueError, match="No annotations"):
+        ClassifyLoader("image", image_size=32).collate([dataset[0]])
 
 
 def test_video_backend_auto_prefers_dali_for_offset_reads_when_available(monkeypatch):

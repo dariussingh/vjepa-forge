@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,8 @@ try:
     from tqdm.auto import tqdm
 except Exception:  # pragma: no cover - optional dependency
     tqdm = None
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -122,11 +125,9 @@ class BaseTrainer:
         if batch.task == "classify":
             return F.cross_entropy(outputs, batch.labels["class_ids"].to(outputs.device))
         if batch.task == "detect":
-            return outputs["pred_boxes"].mean() + outputs["pred_logits"].float().mean()
+            raise NotImplementedError("Detection training/validation loss is not implemented in the generic Forge trainer")
         if batch.task == "segment":
-            if isinstance(outputs, dict):
-                return outputs["pred_masks"].mean() + outputs["pred_logits"].float().mean()
-            return outputs.mean()
+            raise NotImplementedError("Segmentation training/validation loss is not implemented in the generic Forge trainer")
         targets = batch.labels["targets"].to(outputs.device)
         return F.binary_cross_entropy_with_logits(outputs, targets)
 
@@ -141,7 +142,8 @@ class BaseTrainer:
     def validate_epoch(self) -> float | None:
         try:
             loader = self.build_loader(split="val")
-        except Exception:
+        except (FileNotFoundError, KeyError) as exc:
+            logger.warning("Skipping validation split due to missing validation data: %s", exc)
             return None
         self.model.eval()
         total = 0.0

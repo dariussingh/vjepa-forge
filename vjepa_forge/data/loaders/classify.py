@@ -25,6 +25,8 @@ class ClassifyLoader:
         labels: list[int] = []
         meta: list[dict] = []
         for record in records:
+            if not record.annotations:
+                raise ValueError(f"No annotations for {record.media_path} (expected label file at {record.label_path})")
             if self.media == "image":
                 xs.append(read_image(record.media_path, image_size=self.image_size, image_backend=self.image_backend, reader_cache_size=self.reader_cache_size))
                 annotation = record.annotations[0]

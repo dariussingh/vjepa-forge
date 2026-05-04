@@ -915,8 +915,15 @@ def _checkpoint_payload(predictor: nn.Module, cfg: dict[str, Any], *, epoch: int
         media="video",
         checkpoint_kind=checkpoint_kind,
         component="predictor",
-        extras={"predictor_state": predictor.state_dict(), "effective_lr": effective_lr},
+        extras={"effective_lr": effective_lr},
     )
+
+
+def _predictor_state_dict_from_checkpoint(checkpoint: dict[str, Any], checkpoint_path: Path) -> dict[str, Any]:
+    state_dict = checkpoint.get("model_state") or checkpoint.get("predictor_state") or checkpoint.get("extras", {}).get("predictor_state")
+    if state_dict is None:
+        raise ValueError(f"Checkpoint {checkpoint_path} does not contain predictor weights")
+    return state_dict
 
 
 def _resolve_effective_lr(train_cfg: dict[str, Any]) -> tuple[float, dict[str, Any]]:
@@ -957,6 +964,19 @@ def _resolve_checkpoint_path(cfg: dict[str, Any], section: str) -> Path:
     raise ValueError(f"Unsupported checkpoint target: {target}")
 
 
+def _thresholds_from_smoothed_summary(smoothed: dict[str, Any], cfg: dict[str, Any]) -> tuple[float, float, np.ndarray, np.ndarray, np.ndarray]:
+    calibration_labels, calibration_scores_pred = _flatten_metric_arrays(smoothed, "predictor_scores")
+    _, calibration_scores_frozen = _flatten_metric_arrays(smoothed, "frozen_scores")
+    pred_reference = calibration_scores_pred[calibration_labels == 0] if np.any(calibration_labels == 0) else calibration_scores_pred
+    frozen_reference = calibration_scores_frozen[calibration_labels == 0] if np.any(calibration_labels == 0) else calibration_scores_frozen
+    pred_stats = _normal_stats(pred_reference)
+    frozen_stats = _normal_stats(frozen_reference)
+    multiplier = cfg["eval"]["threshold_std_multiplier"]
+    predictor_threshold = float(pred_stats["mean"] + multiplier * pred_stats["std"])
+    frozen_threshold = float(frozen_stats["mean"] + multiplier * frozen_stats["std"])
+    return predictor_threshold, frozen_threshold, calibration_labels, calibration_scores_pred, calibration_scores_frozen
+
+
 def train_from_runtime_config(config: dict[str, Any]) -> AnomalyTrainResult:
     cfg = _build_cfg(config, action="train")
     if int(cfg["train"]["num_workers"]) > 0:
@@ -991,10 +1011,7 @@ def train_from_runtime_config(config: dict[str, Any]) -> AnomalyTrainResult:
     resume_path = resolve_resume_path(cfg["train"].get("resume", False), run_dir=output_root)
     if resume_path is not None:
         checkpoint = load_checkpoint(resume_path)
-        state_dict = checkpoint.get("model_state") or checkpoint.get("predictor_state") or checkpoint.get("extras", {}).get("predictor_state")
-        if state_dict is None:
-            raise ValueError(f"Checkpoint {resume_path} does not contain predictor weights")
-        predictor.load_state_dict(state_dict)
+        predictor.load_state_dict(_predictor_state_dict_from_checkpoint(checkpoint, resume_path))
         if checkpoint.get("optimizer_state") is not None:
             optimizer.load_state_dict(checkpoint["optimizer_state"])
         if checkpoint.get("scheduler_state") is not None:
@@ -1118,7 +1135,7 @@ def _run_eval(config: dict[str, Any], *, split: str) -> tuple[dict[str, Any], Pa
     predictor = build_predictor(cfg["model"], feature_extractor).to(device)
     checkpoint_path = _resolve_checkpoint_path(cfg, "eval")
     checkpoint = load_checkpoint(checkpoint_path)
-    predictor.load_state_dict(checkpoint.get("model_state") or checkpoint.get("predictor_state") or checkpoint.get("extras", {}).get("predictor_state"))
+    predictor.load_state_dict(_predictor_state_dict_from_checkpoint(checkpoint, checkpoint_path))
     predictor.eval()
     summary, timings = _aggregate_scores(
         loaders["val_loader"] if split == "val" else loaders["test_loader"],
@@ -1129,16 +1146,24 @@ def _run_eval(config: dict[str, Any], *, split: str) -> tuple[dict[str, Any], Pa
         model_cfg=cfg["model"],
     )
     smoothed = _build_smoothed_summary(summary, int(cfg["eval"].get("smoothing_window", 1)))
+    calibration_smoothed = smoothed
+    if split != "val":
+        calibration_summary, _ = _aggregate_scores(
+            loaders["val_loader"],
+            predictor,
+            feature_extractor,
+            device,
+            desc="score val (threshold calibration)",
+            model_cfg=cfg["model"],
+        )
+        calibration_smoothed = _build_smoothed_summary(calibration_summary, int(cfg["eval"].get("smoothing_window", 1)))
     labels_raw, scores_pred_raw = _flatten_metric_arrays(summary, "predictor_scores")
     _, scores_frozen_raw = _flatten_metric_arrays(summary, "frozen_scores")
     labels, scores_pred = _flatten_metric_arrays(smoothed, "predictor_scores")
     _, scores_frozen = _flatten_metric_arrays(smoothed, "frozen_scores")
-    val_labels, val_scores_pred = _flatten_metric_arrays(smoothed, "predictor_scores")
-    _, val_scores_frozen = _flatten_metric_arrays(smoothed, "frozen_scores")
-    pred_stats = _normal_stats(val_scores_pred[val_labels == 0] if np.any(val_labels == 0) else val_scores_pred)
-    frozen_stats = _normal_stats(val_scores_frozen[val_labels == 0] if np.any(val_labels == 0) else val_scores_frozen)
-    predictor_threshold = float(pred_stats["mean"] + cfg["eval"]["threshold_std_multiplier"] * pred_stats["std"])
-    frozen_threshold = float(frozen_stats["mean"] + cfg["eval"]["threshold_std_multiplier"] * frozen_stats["std"])
+    predictor_threshold, frozen_threshold, calibration_labels, calibration_scores_pred, calibration_scores_frozen = _thresholds_from_smoothed_summary(calibration_smoothed, cfg)
+    calibration_normals_pred = calibration_scores_pred[calibration_labels == 0] if np.any(calibration_labels == 0) else calibration_scores_pred
+    calibration_normals_frozen = calibration_scores_frozen[calibration_labels == 0] if np.any(calibration_labels == 0) else calibration_scores_frozen
     predictor_clip = _clip_level_metrics(smoothed, "predictor_scores", threshold=predictor_threshold, reduction="max")
     frozen_clip = _clip_level_metrics(smoothed, "frozen_scores", threshold=frozen_threshold, reduction="max")
     metrics = {
@@ -1150,8 +1175,8 @@ def _run_eval(config: dict[str, Any], *, split: str) -> tuple[dict[str, Any], Pa
         "frozen_diff_frame_auc": _roc_auc_score(labels, scores_frozen),
         "predictor_threshold": predictor_threshold,
         "frozen_threshold": frozen_threshold,
-        "predictor_val_false_positive_rate": float(np.mean(val_scores_pred > predictor_threshold)) if len(val_scores_pred) else 0.0,
-        "frozen_val_false_positive_rate": float(np.mean(val_scores_frozen > frozen_threshold)) if len(val_scores_frozen) else 0.0,
+        "predictor_val_false_positive_rate": float(np.mean(calibration_normals_pred > predictor_threshold)) if len(calibration_normals_pred) else 0.0,
+        "frozen_val_false_positive_rate": float(np.mean(calibration_normals_frozen > frozen_threshold)) if len(calibration_normals_frozen) else 0.0,
         "clip_score_reduction": "max",
         "predictor_clip_auc": predictor_clip["auc"],
         "frozen_diff_clip_auc": frozen_clip["auc"],
@@ -1201,6 +1226,8 @@ def _run_predict(config: dict[str, Any]) -> tuple[dict[str, Any], Path, list[str
     output_root = _make_output_root(cfg)
     reports = output_root / "reports"
     reports.mkdir(parents=True, exist_ok=True)
+    predict_out = _predict_output_root(cfg, split=split, source=source)
+    print(f"Output will be saved to: {predict_out}")
     feature_extractor = build_feature_extractor(
         model_name=cfg["model"]["name"],
         checkpoint_path=cfg["model"]["checkpoint"],
@@ -1212,7 +1239,7 @@ def _run_predict(config: dict[str, Any]) -> tuple[dict[str, Any], Path, list[str
     predictor = build_predictor(cfg["model"], feature_extractor).to(device)
     checkpoint_path = _resolve_checkpoint_path(cfg, "eval")
     checkpoint = load_checkpoint(checkpoint_path)
-    predictor.load_state_dict(checkpoint.get("model_state") or checkpoint.get("predictor_state") or checkpoint.get("extras", {}).get("predictor_state"))
+    predictor.load_state_dict(_predictor_state_dict_from_checkpoint(checkpoint, checkpoint_path))
     predictor.eval()
     if source:
         videos = [_build_source_record(source, video_backend=str(cfg["dataset"].get("video_backend", "auto")))]
@@ -1324,7 +1351,7 @@ def export_from_runtime_config(config: dict[str, Any]) -> AnomalyExportResult:
     predictor = build_predictor(cfg["model"], feature_extractor).to(device)
     checkpoint_path = _resolve_checkpoint_path(cfg, "export")
     checkpoint = load_checkpoint(checkpoint_path)
-    predictor.load_state_dict(checkpoint.get("model_state") or checkpoint.get("predictor_state") or checkpoint.get("extras", {}).get("predictor_state"))
+    predictor.load_state_dict(_predictor_state_dict_from_checkpoint(checkpoint, checkpoint_path))
     predictor.eval()
     wrapper = _InferenceWrapper(feature_extractor, predictor, cfg["model"]).to(device)
     wrapper.eval()
