@@ -79,21 +79,25 @@ class BaseTrainer:
         image_size = int(self.model.data_cfg.get("image_size", 384))
         reader_cache_size = int(self.model.data_cfg.get("reader_cache_size", 4))
         video_backend = str(self.model.data_cfg.get("video_backend", "auto"))
+        image_backend = str(self.model.data_cfg.get("image_backend", "auto"))
         if dataset.task == "classify":
-            collator = ClassifyLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size, reader_cache_size=reader_cache_size, video_backend=video_backend)
+            collator = ClassifyLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size, reader_cache_size=reader_cache_size, video_backend=video_backend, image_backend=image_backend)
         elif dataset.task == "detect":
-            collator = DetectLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size, reader_cache_size=reader_cache_size, video_backend=video_backend)
+            collator = DetectLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size, reader_cache_size=reader_cache_size, video_backend=video_backend, image_backend=image_backend)
         elif dataset.task == "segment":
-            collator = SegmentLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size, reader_cache_size=reader_cache_size, video_backend=video_backend)
+            collator = SegmentLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size, reader_cache_size=reader_cache_size, video_backend=video_backend, image_backend=image_backend)
         else:
-            collator = AnomalyLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size, reader_cache_size=reader_cache_size, video_backend=video_backend)
+            collator = AnomalyLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size, reader_cache_size=reader_cache_size, video_backend=video_backend, image_backend=image_backend)
         worker_count = int(self.num_workers)
         if dataset.media == "video" and video_backend == "dali":
+            worker_count = 0
+        if dataset.media == "image" and image_backend == "dali":
             worker_count = 0
         if worker_count <= 0 and dataset.media == "video":
             if video_backend != "dali":
                 worker_count = max(1, min(8, os.cpu_count() or 1))
-        pin_memory = bool(self.model.data_cfg.get("pin_memory", torch.cuda.is_available() and video_backend != "dali"))
+        use_gpu_backend = (dataset.media == "video" and video_backend == "dali") or (dataset.media == "image" and image_backend == "dali")
+        pin_memory = bool(self.model.data_cfg.get("pin_memory", torch.cuda.is_available() and not use_gpu_backend))
         persistent_workers = bool(self.model.data_cfg.get("persistent_workers", dataset.media == "video" and worker_count > 0))
         prefetch_factor = self.model.data_cfg.get("prefetch_factor", 2 if dataset.media == "video" and worker_count > 0 else None)
         loader_kwargs = {

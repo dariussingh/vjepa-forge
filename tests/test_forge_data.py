@@ -5,6 +5,7 @@ from PIL import Image
 
 import vjepa_forge.data.converters.cafe as cafe_converter
 from vjepa_forge.data import AnomalyLoader, ClassifyLoader, DetectLoader, ForgeDataset, ForgeLabelParser, SegmentLoader, convert_cafe_to_forge
+import vjepa_forge.data.image as image_mod
 import vjepa_forge.data.video as video_mod
 
 
@@ -99,6 +100,39 @@ def test_video_backend_auto_prefers_dali_for_offset_reads_when_available(monkeyp
     monkeypatch.setattr(video_mod, "_has_dali", lambda: True)
     backend = video_mod._resolve_backend(source=Path("clip.mp4"), video_backend="auto")
     assert backend == "dali"
+
+
+def test_image_backend_auto_prefers_dali_when_available(monkeypatch):
+    monkeypatch.setattr(image_mod, "_has_dali", lambda: True)
+    monkeypatch.setattr(image_mod.torch.cuda, "is_available", lambda: True)
+    backend = image_mod._resolve_backend(image_backend="auto")
+    assert backend == "dali"
+
+
+def test_read_image_routes_to_dali_when_requested(monkeypatch):
+    monkeypatch.setattr(image_mod, "_has_dali", lambda: True)
+    monkeypatch.setattr(image_mod.torch.cuda, "is_available", lambda: True)
+
+    calls: dict[str, int] = {"dali": 0}
+
+    def _fake_dali(*args, **kwargs):
+        calls["dali"] += 1
+        return torch.zeros(3, 16, 16)
+
+    monkeypatch.setattr(image_mod, "_read_image_dali", _fake_dali)
+    tensor = image_mod.read_image("sample.jpg", image_size=16, image_backend="dali")
+    assert calls["dali"] == 1
+    assert tuple(tensor.shape) == (3, 16, 16)
+
+
+def test_explicit_dali_image_backend_errors_cleanly_when_unavailable(monkeypatch):
+    monkeypatch.setattr(image_mod, "_has_dali", lambda: False)
+    try:
+        image_mod.read_image("sample.jpg", image_backend="dali")
+    except RuntimeError as exc:
+        assert "DALI" in str(exc)
+    else:
+        raise AssertionError("Expected explicit dali image backend to fail when DALI is unavailable")
 
 
 def test_read_video_clip_routes_nonzero_offsets_to_dali_when_requested(monkeypatch):

@@ -17,6 +17,7 @@ data:
   task: classify
   media: image
   image_size: 384
+  image_backend: auto
   video_backend: auto
   past_frames: 8
   future_frames: 8
