@@ -20,6 +20,8 @@ except Exception:  # pragma: no cover - optional dependency
 
 logger = logging.getLogger(__name__)
 
+_CORE_RESULTS_COLUMNS = ("epoch", "train_loss", "val_loss", "lr", "best_fitness")
+
 
 @dataclass
 class TrainResult:
@@ -139,25 +141,95 @@ class BaseTrainer:
     def build_scheduler(self, optimizer: torch.optim.Optimizer):
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
 
-    def validate_epoch(self) -> float | None:
+    def _validator_kwargs(self) -> dict[str, Any]:
+        return {
+            "data": self.data,
+            "batch_size": self.batch_size,
+            "num_workers": self.num_workers,
+            "device": str(self.device),
+            "split": "val",
+            "save": self.save,
+            "save_period": self.save_period,
+            "resume": self.resume,
+            "project": self.project,
+            "name": self.name,
+            "exist_ok": self.exist_ok,
+        }
+
+    def _parse_results_value(self, key: str, value: str) -> Any:
+        if key == "epoch":
+            return int(value)
+        if value == "":
+            return ""
         try:
-            loader = self.build_loader(split="val")
+            return float(value)
+        except ValueError:
+            return value
+
+    def _ordered_metric_items(self, metrics: dict[str, Any] | None) -> list[tuple[str, Any]]:
+        if not metrics:
+            return []
+        return sorted(metrics.items(), key=lambda item: item[0])
+
+    def _results_row(
+        self,
+        *,
+        epoch: int,
+        train_loss: float,
+        val_loss: float | None,
+        lr: float,
+        best_fitness: float,
+        val_metrics: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        row: dict[str, Any] = {
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_loss": "" if val_loss is None else val_loss,
+            "lr": lr,
+            "best_fitness": best_fitness,
+        }
+        for key, value in self._ordered_metric_items(val_metrics):
+            row[key] = value
+        return row
+
+    def _normalized_results_rows(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        metric_keys = sorted({key for row in rows for key in row.keys() if key not in _CORE_RESULTS_COLUMNS})
+        ordered_keys = [*list(_CORE_RESULTS_COLUMNS), *metric_keys]
+        normalized: list[dict[str, Any]] = []
+        for row in rows:
+            normalized.append({key: row.get(key, "") for key in ordered_keys})
+        return normalized
+
+    def _format_metric_value(self, value: Any) -> str:
+        if isinstance(value, float):
+            return f"{value:.4f}"
+        return str(value)
+
+    def _emit_epoch_summary(self, *, epoch: int, train_loss: float, val_loss: float | None, val_metrics: dict[str, Any] | None) -> None:
+        parts = [f"epoch={epoch}", f"train_loss={train_loss:.4f}"]
+        if val_loss is not None:
+            parts.append(f"val_loss={val_loss:.4f}")
+        for key, value in self._ordered_metric_items(val_metrics):
+            parts.append(f"{key}={self._format_metric_value(value)}")
+        summary = " ".join(parts)
+        if tqdm is not None:
+            tqdm.write(summary)
+        else:
+            print(summary)
+
+    def validate_epoch(self):
+        from vjepa_forge.tasks import TASK_REGISTRY
+
+        try:
+            validator = TASK_REGISTRY[str(getattr(self.model, "task", "classify"))]["val"](self.model, **self._validator_kwargs())
         except (FileNotFoundError, KeyError) as exc:
             logger.warning("Skipping validation split due to missing validation data: %s", exc)
             return None
-        self.model.eval()
-        total = 0.0
-        batches = 0
-        with torch.no_grad():
-            progress = self.progress(loader, desc="val", total=len(loader))
-            for batch in progress:
-                batch.x = batch.x.to(self.device)
-                outputs = self.model(batch)
-                total += float(self.compute_loss(batch, outputs).detach().cpu().item())
-                batches += 1
-                if batches > 0 and progress is not loader:
-                    progress.set_postfix(loss=f"{(total / batches):.4f}")
-        return total / max(batches, 1)
+        try:
+            return validator.run()
+        except (FileNotFoundError, KeyError) as exc:
+            logger.warning("Skipping validation split due to missing validation data: %s", exc)
+            return None
 
     def checkpoint_config(self) -> dict[str, Any]:
         return {
@@ -198,14 +270,7 @@ class BaseTrainer:
         for row in results_csv_rows(self.paths.results_csv):
             parsed: dict[str, Any] = {}
             for key, value in row.items():
-                if key == "epoch":
-                    parsed[key] = int(value)
-                elif key in {"train_loss", "lr", "best_fitness"}:
-                    parsed[key] = float(value)
-                elif key == "val_loss":
-                    parsed[key] = "" if value == "" else float(value)
-                else:
-                    parsed[key] = value
+                parsed[key] = self._parse_results_value(key, value)
             rows.append(parsed)
         return int(checkpoint["epoch"]) + 1, int(checkpoint.get("global_step", 0)), float(checkpoint.get("best_fitness", float("inf"))), rows
 
@@ -217,11 +282,19 @@ class BaseTrainer:
         best_fitness: float,
         train_loss: float,
         val_loss: float | None,
+        val_metrics: dict[str, Any] | None,
         optimizer: torch.optim.Optimizer,
         scheduler,
         checkpoint_kind: str,
         target_path: Path,
     ) -> None:
+        metrics = {
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "lr": float(optimizer.param_groups[0]["lr"]),
+        }
+        if val_metrics:
+            metrics.update(val_metrics)
         payload = checkpoint_payload(
             model_state=self.model.state_dict(),
             optimizer_state=optimizer.state_dict(),
@@ -229,11 +302,7 @@ class BaseTrainer:
             epoch=epoch,
             global_step=global_step,
             best_fitness=best_fitness,
-            metrics={
-                "train_loss": train_loss,
-                "val_loss": val_loss,
-                "lr": float(optimizer.param_groups[0]["lr"]),
-            },
+            metrics=metrics,
             config=self.checkpoint_config(),
             task=str(getattr(self.model, "task", "unknown")),
             media=str(getattr(self.model, "media", "unknown")),
@@ -267,19 +336,24 @@ class BaseTrainer:
                     progress.set_postfix(loss=f"{last_loss:.4f}")
             scheduler.step()
             train_loss = sum(epoch_losses) / max(len(epoch_losses), 1)
-            val_loss = self.validate_epoch()
+            val_result = self.validate_epoch()
+            val_loss = None if val_result is None else float(val_result.loss)
+            val_metrics = None if val_result is None else val_result.metrics
             fitness = float(val_loss if val_loss is not None else train_loss)
             previous_best = best_fitness
             best_fitness = min(best_fitness, fitness)
             rows.append(
-                {
-                    "epoch": epoch_idx,
-                    "train_loss": train_loss,
-                    "val_loss": "" if val_loss is None else val_loss,
-                    "lr": float(optimizer.param_groups[0]["lr"]),
-                    "best_fitness": best_fitness,
-                }
+                self._results_row(
+                    epoch=epoch_idx,
+                    train_loss=train_loss,
+                    val_loss=val_loss,
+                    lr=float(optimizer.param_groups[0]["lr"]),
+                    best_fitness=best_fitness,
+                    val_metrics=val_metrics,
+                )
             )
+            rows = self._normalized_results_rows(rows)
+            self._emit_epoch_summary(epoch=epoch_idx, train_loss=train_loss, val_loss=val_loss, val_metrics=val_metrics)
             write_results_csv(self.paths.results_csv, rows)
             if self.save:
                 self._save_epoch_checkpoint(
@@ -288,6 +362,7 @@ class BaseTrainer:
                     best_fitness=best_fitness,
                     train_loss=train_loss,
                     val_loss=val_loss,
+                    val_metrics=val_metrics,
                     optimizer=optimizer,
                     scheduler=scheduler,
                     checkpoint_kind="last",
@@ -300,6 +375,7 @@ class BaseTrainer:
                         best_fitness=best_fitness,
                         train_loss=train_loss,
                         val_loss=val_loss,
+                        val_metrics=val_metrics,
                         optimizer=optimizer,
                         scheduler=scheduler,
                         checkpoint_kind="best",
@@ -312,6 +388,7 @@ class BaseTrainer:
                         best_fitness=best_fitness,
                         train_loss=train_loss,
                         val_loss=val_loss,
+                        val_metrics=val_metrics,
                         optimizer=optimizer,
                         scheduler=scheduler,
                         checkpoint_kind="epoch",

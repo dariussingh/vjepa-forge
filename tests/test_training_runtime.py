@@ -15,6 +15,8 @@ from vjepa_forge.heads.anomaly.modeling import ExtractedFeatures
 import vjepa_forge.tasks.anomaly.runtime as anomaly_runtime_mod
 import vjepa_forge.tasks.anomaly.predict as anomaly_predict_mod
 import vjepa_forge.tasks.anomaly.val as anomaly_val_mod
+from vjepa_forge.engine.validator import ValidationResult
+from vjepa_forge.tasks import TASK_REGISTRY
 
 
 def _write_dataset(root: Path) -> Path:
@@ -66,6 +68,8 @@ def test_forge_model_train_val_predict_roundtrip(tmp_path: Path):
     pred_result = model.predict(data=str(dataset_yaml), batch_size=1, num_workers=0, device="cpu", split="val")
     assert train_result.steps == 2
     assert val_result.batches == 1
+    assert val_result.metrics is not None
+    assert "top1" in val_result.metrics
     assert len(pred_result.outputs) == 1
 
 
@@ -86,6 +90,10 @@ def test_forge_model_train_saves_and_resumes_checkpoints(tmp_path: Path):
     assert Path(first.last_checkpoint).exists()
     assert Path(first.best_checkpoint).exists()
     assert Path(first.run_dir, "results.csv").exists()
+    header = (Path(first.run_dir) / "results.csv").read_text(encoding="utf-8").splitlines()[0]
+    assert "top1" in header
+    checkpoint = load_checkpoint(first.last_checkpoint)
+    assert "top1" in checkpoint["metrics"]
 
     resumed_model = ForgeModel(
         {
@@ -110,6 +118,7 @@ def test_forge_model_train_saves_and_resumes_checkpoints(tmp_path: Path):
     )
     rows = (Path(second.run_dir) / "results.csv").read_text(encoding="utf-8").strip().splitlines()
     assert len(rows) == 3
+    assert "top1" in rows[0].split(",")
     assert rows[-1].startswith("2,")
 
 
@@ -125,9 +134,21 @@ def test_trainer_skips_missing_validation_split_with_warning(caplog):
         data={"task": "classify", "media": "image", "image_size": 32},
     )
     trainer = BaseTrainer(model, data="unused", num_workers=0)
-    trainer.build_loader = lambda split="val": (_ for _ in ()).throw(FileNotFoundError("missing val split"))  # type: ignore[method-assign]
+    original_validator = TASK_REGISTRY["classify"]["val"]
+
+    class MissingValValidator:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def run(self):
+            raise FileNotFoundError("missing val split")
+
+    TASK_REGISTRY["classify"]["val"] = MissingValValidator
     with caplog.at_level("WARNING"):
-        assert trainer.validate_epoch() is None
+        try:
+            assert trainer.validate_epoch() is None
+        finally:
+            TASK_REGISTRY["classify"]["val"] = original_validator
     assert "Skipping validation split" in caplog.text
 
 
@@ -143,9 +164,52 @@ def test_trainer_propagates_unexpected_validation_errors():
         data={"task": "classify", "media": "image", "image_size": 32},
     )
     trainer = BaseTrainer(model, data="unused", num_workers=0)
-    trainer.build_loader = lambda split="val": (_ for _ in ()).throw(RuntimeError("cuda oom"))  # type: ignore[method-assign]
-    with pytest.raises(RuntimeError, match="cuda oom"):
-        trainer.validate_epoch()
+    original_validator = TASK_REGISTRY["classify"]["val"]
+
+    class BrokenValidator:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def run(self):
+            raise RuntimeError("cuda oom")
+
+    TASK_REGISTRY["classify"]["val"] = BrokenValidator
+    try:
+        with pytest.raises(RuntimeError, match="cuda oom"):
+            trainer.validate_epoch()
+    finally:
+        TASK_REGISTRY["classify"]["val"] = original_validator
+
+
+def test_trainer_validate_epoch_returns_task_validation_result():
+    model = ForgeModel(
+        {
+            "task": "classify",
+            "media": "image",
+            "backbone": {"name": "vit_base", "use_sdpa": False, "modality_embedding": False},
+            "image_size": 32,
+            "num_classes": 2,
+        },
+        data={"task": "classify", "media": "image", "image_size": 32},
+    )
+    trainer = BaseTrainer(model, data="unused", num_workers=0)
+    original_validator = TASK_REGISTRY["classify"]["val"]
+
+    class StubValidator:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def run(self):
+            return ValidationResult(loss=0.25, batches=1, metrics={"top1": 1.0}, split="val")
+
+    TASK_REGISTRY["classify"]["val"] = StubValidator
+    try:
+        result = trainer.validate_epoch()
+    finally:
+        TASK_REGISTRY["classify"]["val"] = original_validator
+    assert result is not None
+    assert result.loss == 0.25
+    assert result.metrics == {"top1": 1.0}
 
 
 def test_detect_and_segment_losses_fail_fast():
