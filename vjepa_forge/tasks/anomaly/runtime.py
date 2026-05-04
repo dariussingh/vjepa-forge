@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 import json
 import math
 import os
 import random
+import time
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +17,7 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
 from vjepa_forge.data.forge.dataset import ForgeDataset
-from vjepa_forge.data.video import get_video_frame_count, read_video_clip, read_video_frames_uint8
+from vjepa_forge.data.video import get_video_frame_count, read_video_clip, read_video_clips, read_video_frames_uint8
 from vjepa_forge.engine.checkpointing import checkpoint_paths, checkpoint_payload, load_checkpoint, resolve_resume_path, resolve_run_dir, results_csv_rows, save_checkpoint, write_results_csv
 from vjepa_forge.heads.anomaly.modeling import ExtractedFeatures, build_feature_extractor, build_predictor
 
@@ -84,29 +86,47 @@ class ForgeAnomalyWindowDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, Any]:
         window = self.windows[index]
         record = self.video_lookup[window.video_name]
-        past_len = len(window.past_indices)
-        future_len = len(window.future_indices)
-        clip_start = int(window.past_indices[0])
-        clip = read_video_clip(
-            record.media_path,
-            clip_start=clip_start,
-            clip_len=past_len + future_len,
-            stride=1,
-            image_size=self.image_size,
-            reader_cache_size=self.reader_cache_size,
-            video_backend=self.video_backend,
-        )
-        past = clip[:past_len].permute(1, 0, 2, 3).contiguous()
-        future = clip[past_len : past_len + future_len].permute(1, 0, 2, 3).contiguous()
         sample: dict[str, Any] = {
-            "past": past,
-            "future": future,
             "video_name": record.name,
+            "media_path": record.media_path,
+            "clip_start": int(window.past_indices[0]),
+            "clip_len": len(window.past_indices) + len(window.future_indices),
+            "past_len": len(window.past_indices),
             "future_indices": torch.tensor(window.future_indices, dtype=torch.long),
         }
         if window.future_labels is not None:
             sample["future_labels"] = torch.tensor(window.future_labels, dtype=torch.long)
         return sample
+
+
+class _WindowBatchSampler:
+    def __init__(self, windows: list[WindowRecord], *, batch_size: int, shuffle: bool) -> None:
+        self.batch_size = max(1, int(batch_size))
+        self.shuffle = bool(shuffle)
+        grouped: dict[str, list[int]] = {}
+        for idx, window in enumerate(windows):
+            grouped.setdefault(window.video_name, []).append(idx)
+        self.groups = list(grouped.values())
+
+    def __iter__(self):
+        groups = [list(group) for group in self.groups]
+        if self.shuffle:
+            random.shuffle(groups)
+            for group in groups:
+                if len(group) > self.batch_size:
+                    chunks = [group[i : i + self.batch_size] for i in range(0, len(group), self.batch_size)]
+                    random.shuffle(chunks)
+                    group[:] = [idx for chunk in chunks for idx in chunk]
+        batches: list[list[int]] = []
+        for group in groups:
+            for start in range(0, len(group), self.batch_size):
+                batches.append(group[start : start + self.batch_size])
+        if self.shuffle:
+            random.shuffle(batches)
+        return iter(batches)
+
+    def __len__(self) -> int:
+        return sum((len(group) + self.batch_size - 1) // self.batch_size for group in self.groups)
 
 
 class _InferenceWrapper(nn.Module):
@@ -343,6 +363,79 @@ def _build_window_records(videos: list[VideoClipRecord], past_frames: int, futur
     return windows
 
 
+def _collate_window_batch(batch: list[dict[str, Any]], *, image_size: int, reader_cache_size: int, video_backend: str) -> dict[str, Any]:
+    if not batch:
+        return {}
+    decode_start = time.perf_counter()
+    effective_backend = "decord" if str(video_backend).lower() == "dali" else video_backend
+
+    # Group by video path so each video is decoded once.
+    # _WindowBatchSampler already co-locates windows from the same video,
+    # so typically all batch items share one path and only the minimal
+    # contiguous frame range needs to be read (O(B+T) instead of O(B*T)).
+    groups: dict[str, list[int]] = {}
+    for idx, sample in enumerate(batch):
+        groups.setdefault(sample["media_path"], []).append(idx)
+
+    decoded_clips: list[torch.Tensor] = [torch.empty(0)] * len(batch)
+    for path, indices in groups.items():
+        min_start = min(int(batch[i]["clip_start"]) for i in indices)
+        max_end = max(int(batch[i]["clip_start"]) + int(batch[i]["clip_len"]) for i in indices)
+        full = read_video_clip(
+            path,
+            clip_start=min_start,
+            clip_len=max_end - min_start,
+            stride=1,
+            image_size=image_size,
+            reader_cache_size=reader_cache_size,
+            video_backend=effective_backend,
+        )
+        for i in indices:
+            s = int(batch[i]["clip_start"]) - min_start
+            decoded_clips[i] = full[s : s + int(batch[i]["clip_len"])]
+
+    past_lens = [int(sample["past_len"]) for sample in batch]
+    future_len = max(0, int(batch[0]["clip_len"]) - past_lens[0])
+    past = torch.stack([decoded_clips[i][:pl].permute(1, 0, 2, 3).contiguous() for i, pl in enumerate(past_lens)], dim=0)
+    future = torch.stack([decoded_clips[i][pl : pl + future_len].permute(1, 0, 2, 3).contiguous() for i, pl in enumerate(past_lens)], dim=0)
+    collated: dict[str, Any] = {
+        "past": past,
+        "future": future,
+        "video_name": [sample["video_name"] for sample in batch],
+        "future_indices": torch.stack([sample["future_indices"] for sample in batch], dim=0),
+        "decode_time": float(time.perf_counter() - decode_start),
+    }
+    if "future_labels" in batch[0]:
+        collated["future_labels"] = torch.stack([sample["future_labels"] for sample in batch], dim=0)
+    return collated
+
+
+def _loader_kwargs(
+    *,
+    batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+    persistent_workers: bool,
+    prefetch_factor: int,
+    collate_fn,
+    batch_sampler=None,
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "num_workers": int(num_workers),
+        "collate_fn": collate_fn,
+        "pin_memory": bool(pin_memory),
+    }
+    if batch_sampler is not None:
+        kwargs["batch_sampler"] = batch_sampler
+    else:
+        kwargs["batch_size"] = int(batch_size)
+        kwargs["shuffle"] = False
+    if int(num_workers) > 0:
+        kwargs["persistent_workers"] = bool(persistent_workers)
+        kwargs["prefetch_factor"] = int(prefetch_factor)
+    return kwargs
+
+
 def _make_loaders(cfg: dict[str, Any], include_test: bool = True) -> dict[str, Any]:
     dataset_cfg = cfg["dataset"]
     train_videos = _build_video_records(dataset_cfg["dataset_yaml"], split="train")
@@ -368,27 +461,36 @@ def _make_loaders(cfg: dict[str, Any], include_test: bool = True) -> dict[str, A
         test_ds.reader_cache_size = int(cfg["eval"]["reader_cache_size"])
     train_num_workers = int(cfg["train"]["num_workers"])
     eval_num_workers = int(cfg["eval"]["num_workers"])
-    if video_backend == "dali":
-        train_num_workers = 0
-        eval_num_workers = 0
-    train_loader_kwargs = {
-        "batch_size": cfg["train"]["batch_size"],
-        "shuffle": True,
-        "num_workers": train_num_workers,
-        "pin_memory": bool(cfg["train"]["pin_memory"] and video_backend != "dali"),
-    }
-    eval_loader_kwargs = {
-        "batch_size": cfg["eval"]["batch_size"],
-        "shuffle": False,
-        "num_workers": eval_num_workers,
-        "pin_memory": bool(cfg["eval"]["pin_memory"] and video_backend != "dali"),
-    }
-    if train_num_workers > 0:
-        train_loader_kwargs["persistent_workers"] = bool(cfg["train"]["persistent_workers"])
-        train_loader_kwargs["prefetch_factor"] = int(cfg["train"]["prefetch_factor"])
-    if eval_num_workers > 0:
-        eval_loader_kwargs["persistent_workers"] = bool(cfg["eval"]["persistent_workers"])
-        eval_loader_kwargs["prefetch_factor"] = int(cfg["eval"]["prefetch_factor"])
+    train_collate = partial(
+        _collate_window_batch,
+        image_size=image_size,
+        reader_cache_size=int(cfg["train"]["reader_cache_size"]),
+        video_backend=video_backend,
+    )
+    eval_collate = partial(
+        _collate_window_batch,
+        image_size=image_size,
+        reader_cache_size=int(cfg["eval"]["reader_cache_size"]),
+        video_backend=video_backend,
+    )
+    train_loader_kwargs = _loader_kwargs(
+        batch_size=int(cfg["train"]["batch_size"]),
+        num_workers=train_num_workers,
+        pin_memory=bool(cfg["train"]["pin_memory"] and video_backend != "dali"),
+        persistent_workers=bool(cfg["train"]["persistent_workers"]),
+        prefetch_factor=int(cfg["train"]["prefetch_factor"]),
+        collate_fn=train_collate,
+        batch_sampler=_WindowBatchSampler(train_windows, batch_size=int(cfg["train"]["batch_size"]), shuffle=True),
+    )
+    eval_loader_kwargs = _loader_kwargs(
+        batch_size=int(cfg["eval"]["batch_size"]),
+        num_workers=eval_num_workers,
+        pin_memory=bool(cfg["eval"]["pin_memory"] and video_backend != "dali"),
+        persistent_workers=bool(cfg["eval"]["persistent_workers"]),
+        prefetch_factor=int(cfg["eval"]["prefetch_factor"]),
+        collate_fn=eval_collate,
+        batch_sampler=_WindowBatchSampler(val_windows, batch_size=int(cfg["eval"]["batch_size"]), shuffle=False),
+    )
     loaders: dict[str, Any] = {
         "train_videos": train_videos,
         "val_videos": val_videos,
@@ -397,7 +499,16 @@ def _make_loaders(cfg: dict[str, Any], include_test: bool = True) -> dict[str, A
         "val_loader": DataLoader(val_ds, **eval_loader_kwargs),
     }
     if test_ds is not None:
-        loaders["test_loader"] = DataLoader(test_ds, **eval_loader_kwargs)
+        test_loader_kwargs = _loader_kwargs(
+            batch_size=int(cfg["eval"]["batch_size"]),
+            num_workers=eval_num_workers,
+            pin_memory=bool(cfg["eval"]["pin_memory"] and video_backend != "dali"),
+            persistent_workers=bool(cfg["eval"]["persistent_workers"]),
+            prefetch_factor=int(cfg["eval"]["prefetch_factor"]),
+            collate_fn=eval_collate,
+            batch_sampler=_WindowBatchSampler(test_windows, batch_size=int(cfg["eval"]["batch_size"]), shuffle=False),
+        )
+        loaders["test_loader"] = DataLoader(test_ds, **test_loader_kwargs)
     return loaders
 
 
@@ -419,17 +530,20 @@ def _build_eval_loader(
     ds = ForgeAnomalyWindowDataset(videos, windows, dataset_cfg["image_size"], video_backend=video_backend)
     ds.reader_cache_size = int(cfg["eval"]["reader_cache_size"])
     worker_count = int(cfg["eval"]["num_workers"] if num_workers is None else num_workers)
-    if video_backend == "dali":
-        worker_count = 0
-    loader_kwargs = {
-        "batch_size": int(cfg["eval"]["batch_size"] if batch_size is None else batch_size),
-        "shuffle": False,
-        "num_workers": worker_count,
-        "pin_memory": bool(cfg["eval"]["pin_memory"] and video_backend != "dali"),
-    }
-    if worker_count > 0:
-        loader_kwargs["persistent_workers"] = bool(cfg["eval"]["persistent_workers"])
-        loader_kwargs["prefetch_factor"] = int(cfg["eval"]["prefetch_factor"])
+    loader_kwargs = _loader_kwargs(
+        batch_size=int(cfg["eval"]["batch_size"] if batch_size is None else batch_size),
+        num_workers=worker_count,
+        pin_memory=bool(cfg["eval"]["pin_memory"] and video_backend != "dali"),
+        persistent_workers=bool(cfg["eval"]["persistent_workers"]),
+        prefetch_factor=int(cfg["eval"]["prefetch_factor"]),
+        collate_fn=partial(
+            _collate_window_batch,
+            image_size=dataset_cfg["image_size"],
+            reader_cache_size=int(cfg["eval"]["reader_cache_size"]),
+            video_backend=video_backend,
+        ),
+        batch_sampler=_WindowBatchSampler(windows, batch_size=int(cfg["eval"]["batch_size"] if batch_size is None else batch_size), shuffle=False),
+    )
     return DataLoader(ds, **loader_kwargs)
 
 
@@ -493,6 +607,16 @@ def _normal_stats(scores: np.ndarray) -> dict[str, float]:
     return {"mean": float(scores.mean()) if len(scores) else 0.0, "std": float(scores.std()) if len(scores) else 0.0}
 
 
+def _timing_metrics(*, decode_times: list[float], model_times: list[float]) -> dict[str, float]:
+    avg_decode = float(np.mean(decode_times)) if decode_times else 0.0
+    avg_model = float(np.mean(model_times)) if model_times else 0.0
+    return {
+        "avg_decode_time": avg_decode,
+        "avg_model_time": avg_model,
+        "avg_step_time": avg_decode + avg_model,
+    }
+
+
 def _roc_auc_score(labels: np.ndarray, scores: np.ndarray) -> float:
     labels = labels.astype(np.int64)
     scores = scores.astype(np.float64)
@@ -525,10 +649,14 @@ def _smooth_scores(scores: np.ndarray, window: int) -> np.ndarray:
     return np.convolve(padded, kernel, mode="valid").astype(np.float32)
 
 
-def _aggregate_scores(loader: DataLoader, predictor: nn.Module, feature_extractor: nn.Module, device: torch.device, desc: str, model_cfg: dict[str, Any]) -> dict[str, Any]:
+def _aggregate_scores(loader: DataLoader, predictor: nn.Module, feature_extractor: nn.Module, device: torch.device, desc: str, model_cfg: dict[str, Any]) -> tuple[dict[str, Any], dict[str, float]]:
     by_video: dict[str, dict[str, Any]] = {}
     predictor.eval()
+    decode_times: list[float] = []
+    model_times: list[float] = []
     for batch in _progress(loader, desc=desc, total=len(loader)):
+        decode_times.append(float(batch.get("decode_time", 0.0)))
+        model_start = time.perf_counter()
         past_feat, future_feat = _extract_pair_features(feature_extractor, batch, device)
         predictor_scores_t, frozen_scores_t = _predict_sample_scores(
             predictor,
@@ -537,6 +665,7 @@ def _aggregate_scores(loader: DataLoader, predictor: nn.Module, feature_extracto
             model_cfg,
             tubelet_size=feature_extractor.tubelet_size,
         )
+        model_times.append(float(time.perf_counter() - model_start))
         predictor_scores = predictor_scores_t.detach().cpu().numpy()
         frozen_scores = frozen_scores_t.detach().cpu().numpy()
         future_indices = batch["future_indices"].numpy()
@@ -569,7 +698,7 @@ def _aggregate_scores(loader: DataLoader, predictor: nn.Module, feature_extracto
             "frozen_scores": frozen_series.tolist(),
             "labels": None if labels is None else labels.tolist(),
         }
-    return summary
+    return summary, _timing_metrics(decode_times=decode_times, model_times=model_times)
 
 
 def _flatten_metric_arrays(video_summary: dict[str, Any], key: str) -> tuple[np.ndarray, np.ndarray]:
@@ -830,6 +959,8 @@ def _resolve_checkpoint_path(cfg: dict[str, Any], section: str) -> Path:
 
 def train_from_runtime_config(config: dict[str, Any]) -> AnomalyTrainResult:
     cfg = _build_cfg(config, action="train")
+    if int(cfg["train"]["num_workers"]) > 0:
+        torch.multiprocessing.set_sharing_strategy("file_system")
     device = _resolve_device(cfg["train"]["device"])
     _seed_everything(cfg["train"]["seed"])
     loaders = _make_loaders(cfg, include_test=False)
@@ -873,38 +1004,64 @@ def train_from_runtime_config(config: dict[str, Any]) -> AnomalyTrainResult:
         best_val = float(checkpoint.get("best_fitness", checkpoint.get("best_val_loss", math.inf)))
     best_path = paths.best
     last_path = paths.last
+    epoch_timing_rows: list[dict[str, float]] = []
     for epoch in range(start_epoch, cfg["train"]["epochs"] + 1):
         predictor.train()
         train_losses: list[float] = []
+        train_decode_times: list[float] = []
+        train_model_times: list[float] = []
         train_bar = _progress(loaders["train_loader"], desc=f"train {epoch}/{cfg['train']['epochs']}", total=len(loaders["train_loader"]))
         for batch in train_bar:
+            train_decode_times.append(float(batch.get("decode_time", 0.0)))
+            model_start = time.perf_counter()
             past_feat, future_feat = _extract_pair_features(feature_extractor, batch, device)
             predictor_scores, _ = _predict_sample_scores(predictor, past_feat, future_feat, cfg["model"], tubelet_size=feature_extractor.tubelet_size)
             loss = predictor_scores.mean()
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
+            train_model_times.append(float(time.perf_counter() - model_start))
             train_losses.append(float(loss.item()))
             global_step += 1
             if tqdm is not None:
                 train_bar.set_postfix(loss=f"{train_losses[-1]:.5f}")
         predictor.eval()
         val_losses: list[float] = []
+        val_decode_times: list[float] = []
+        val_model_times: list[float] = []
         with torch.no_grad():
             val_bar = _progress(loaders["val_loader"], desc=f"val {epoch}/{cfg['train']['epochs']}", total=len(loaders["val_loader"]))
             for batch in val_bar:
+                val_decode_times.append(float(batch.get("decode_time", 0.0)))
+                model_start = time.perf_counter()
                 past_feat, future_feat = _extract_pair_features(feature_extractor, batch, device)
                 predictor_scores, _ = _predict_sample_scores(predictor, past_feat, future_feat, cfg["model"], tubelet_size=feature_extractor.tubelet_size)
                 val_loss_value = float(predictor_scores.mean().item())
+                val_model_times.append(float(time.perf_counter() - model_start))
                 val_losses.append(val_loss_value)
                 if tqdm is not None:
                     val_bar.set_postfix(loss=f"{val_loss_value:.5f}")
         scheduler.step()
         train_loss = float(np.mean(train_losses))
         val_loss = float(np.mean(val_losses))
+        train_timings = _timing_metrics(decode_times=train_decode_times, model_times=train_model_times)
+        val_timings = _timing_metrics(decode_times=val_decode_times, model_times=val_model_times)
         previous_best = best_val
         best_val = min(best_val, val_loss)
-        train_rows.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss, "lr": float(optimizer.param_groups[0]["lr"]), "best_fitness": best_val})
+        train_rows.append(
+            {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "lr": float(optimizer.param_groups[0]["lr"]),
+                "best_fitness": best_val,
+                "avg_train_decode_time": train_timings["avg_decode_time"],
+                "avg_train_model_time": train_timings["avg_model_time"],
+                "avg_val_decode_time": val_timings["avg_decode_time"],
+                "avg_val_model_time": val_timings["avg_model_time"],
+            }
+        )
+        epoch_timing_rows.append({"epoch": epoch, **train_timings, **{f"val_{key}": value for key, value in val_timings.items()}})
         write_results_csv(paths.results_csv, train_rows)
         if cfg["train"]["save"]:
             latest_payload = _checkpoint_payload(predictor, cfg, epoch=epoch, train_loss=train_loss, val_loss=val_loss, best_val_loss=best_val, effective_lr=effective_lr, checkpoint_kind="last")
@@ -928,7 +1085,14 @@ def train_from_runtime_config(config: dict[str, Any]) -> AnomalyTrainResult:
                 epoch_payload["best_fitness"] = best_val
                 save_checkpoint(epoch_payload, paths.weights_dir / f"epoch_{epoch:03d}.pt")
     _write_csv(reports / "train_log.csv", train_rows)
-    summary = {"best_val_loss": best_val, "best_checkpoint": str(best_path), "last_checkpoint": str(last_path), "effective_lr": effective_lr, "run_dir": str(output_root)}
+    summary = {
+        "best_val_loss": best_val,
+        "best_checkpoint": str(best_path),
+        "last_checkpoint": str(last_path),
+        "effective_lr": effective_lr,
+        "run_dir": str(output_root),
+        "timings": epoch_timing_rows,
+    }
     _write_json(reports / "train_summary.json", summary)
     return AnomalyTrainResult(best_val_loss=best_val, best_checkpoint=str(best_path), last_checkpoint=str(last_path), run_dir=str(output_root))
 
@@ -956,7 +1120,7 @@ def _run_eval(config: dict[str, Any], *, split: str) -> tuple[dict[str, Any], Pa
     checkpoint = load_checkpoint(checkpoint_path)
     predictor.load_state_dict(checkpoint.get("model_state") or checkpoint.get("predictor_state") or checkpoint.get("extras", {}).get("predictor_state"))
     predictor.eval()
-    summary = _aggregate_scores(
+    summary, timings = _aggregate_scores(
         loaders["val_loader"] if split == "val" else loaders["test_loader"],
         predictor,
         feature_extractor,
@@ -1007,6 +1171,7 @@ def _run_eval(config: dict[str, Any], *, split: str) -> tuple[dict[str, Any], Pa
         "frozen_diff_clip_counts": frozen_clip["counts"],
         "smoothing_window": int(cfg["eval"].get("smoothing_window", 1)),
         "checkpoint_path": str(checkpoint_path),
+        **timings,
     }
     report_path = reports / f"{split}_metrics.json"
     _write_json(report_path, metrics)
@@ -1063,7 +1228,7 @@ def _run_predict(config: dict[str, Any]) -> tuple[dict[str, Any], Path, list[str
         videos = loaders["val_videos"] if split == "val" else loaders["test_videos"]
         loader = loaders["val_loader"] if split == "val" else loaders["test_loader"]
         desc = f"predict:{split}"
-    summary = _aggregate_scores(loader, predictor, feature_extractor, device, desc=desc, model_cfg=cfg["model"])
+    summary, timings = _aggregate_scores(loader, predictor, feature_extractor, device, desc=desc, model_cfg=cfg["model"])
     smoothed = _build_smoothed_summary(summary, int(cfg["eval"].get("smoothing_window", 1)))
     report_stem = "source" if source else str(split)
     _write_json(reports / f"{report_stem}_predict_scores.json", summary)
@@ -1076,6 +1241,7 @@ def _run_predict(config: dict[str, Any]) -> tuple[dict[str, Any], Path, list[str
         "smoothing_window": int(cfg["eval"].get("smoothing_window", 1)),
         "checkpoint_path": str(checkpoint_path),
         "threshold": None if threshold is None else float(threshold),
+        **timings,
     }
     if not source:
         labels_raw, scores_pred_raw = _flatten_metric_arrays(summary, "predictor_scores")

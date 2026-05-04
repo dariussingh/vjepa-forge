@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import OrderedDict
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import torch
@@ -13,7 +13,7 @@ import torch.nn.functional as F
 _READER_CACHE_BY_WORKER: dict[tuple[int, int | None], OrderedDict[str, Any]] = {}
 _FRAME_COUNT_CACHE_BY_WORKER: dict[tuple[int, int | None], dict[str, int]] = {}
 _ENCODED_VIDEO_CACHE_BY_WORKER: dict[tuple[int, int | None], OrderedDict[str, np.ndarray]] = {}
-_DALI_PIPELINE_CACHE_BY_WORKER: dict[tuple[int, int | None], OrderedDict[tuple[int, int], Any]] = {}
+_DALI_PIPELINE_CACHE_BY_WORKER: dict[tuple[int, int | None], OrderedDict[tuple[int, int, int], Any]] = {}
 _DEFAULT_READER_CACHE_SIZE = 4
 _DEFAULT_VIDEO_BACKEND = "auto"
 
@@ -51,7 +51,7 @@ def _encoded_video_cache(cache_size: int) -> OrderedDict[str, np.ndarray]:
     return cache
 
 
-def _dali_pipeline_cache(cache_size: int) -> OrderedDict[tuple[int, int], Any]:
+def _dali_pipeline_cache(cache_size: int) -> OrderedDict[tuple[int, int, int], Any]:
     key = _worker_key()
     cache = _DALI_PIPELINE_CACHE_BY_WORKER.setdefault(key, OrderedDict())
     while len(cache) > max(0, cache_size):
@@ -118,12 +118,12 @@ def _get_encoded_video_bytes(path: Path, *, reader_cache_size: int = _DEFAULT_RE
 
 
 class _DaliVideoPipeline:
-    def __init__(self, *, image_size: int, device_id: int) -> None:
+    def __init__(self, *, image_size: int, device_id: int, batch_size: int) -> None:
         from nvidia.dali import pipeline_def
         import nvidia.dali.fn as fn
 
         @pipeline_def(
-            batch_size=1,
+            batch_size=batch_size,
             num_threads=2,
             device_id=device_id,
             exec_async=False,
@@ -134,7 +134,7 @@ class _DaliVideoPipeline:
             start_frame = fn.external_source(name="start_frame", device="cpu")
             sequence_length = fn.external_source(name="sequence_length", device="cpu")
             stride = fn.external_source(name="stride", device="cpu")
-            frames = fn.experimental.decoders.video(
+            frames = fn.decoders.video(
                 encoded,
                 device="mixed",
                 start_frame=start_frame,
@@ -147,21 +147,27 @@ class _DaliVideoPipeline:
         self.pipeline = video_pipe()
         self.pipeline.build()
 
-    def run(self, *, encoded: np.ndarray, start_frame: int, sequence_length: int, stride: int) -> Any:
-        self.pipeline.feed_input("encoded", [encoded])
-        self.pipeline.feed_input("start_frame", np.asarray([start_frame], dtype=np.int32))
-        self.pipeline.feed_input("sequence_length", np.asarray([sequence_length], dtype=np.int32))
-        self.pipeline.feed_input("stride", np.asarray([stride], dtype=np.int32))
-        self.pipeline.reset()
+    def run(
+        self,
+        *,
+        encoded: Sequence[np.ndarray],
+        start_frame: Sequence[int],
+        sequence_length: Sequence[int],
+        stride: Sequence[int],
+    ) -> Any:
+        self.pipeline.feed_input("encoded", list(encoded))
+        self.pipeline.feed_input("start_frame", [np.int32(value) for value in start_frame])
+        self.pipeline.feed_input("sequence_length", [np.int32(value) for value in sequence_length])
+        self.pipeline.feed_input("stride", [np.int32(value) for value in stride])
         return self.pipeline.run()[0]
 
 
-def _get_dali_pipeline(*, image_size: int, device_id: int, reader_cache_size: int) -> _DaliVideoPipeline:
+def _get_dali_pipeline(*, image_size: int, device_id: int, batch_size: int, reader_cache_size: int) -> _DaliVideoPipeline:
     cache = _dali_pipeline_cache(reader_cache_size)
-    key = (int(image_size), int(device_id))
+    key = (int(image_size), int(device_id), int(batch_size))
     pipeline = cache.pop(key, None)
     if pipeline is None:
-        pipeline = _DaliVideoPipeline(image_size=image_size, device_id=device_id)
+        pipeline = _DaliVideoPipeline(image_size=image_size, device_id=device_id, batch_size=batch_size)
     cache[key] = pipeline
     while len(cache) > max(0, reader_cache_size):
         cache.popitem(last=False)
@@ -224,18 +230,53 @@ def _read_video_clip_dali(
     target_len = int(clip_len)
     if target_len <= 0:
         return torch.empty((0, 3, image_size, image_size), dtype=torch.float32)
-    encoded = _get_encoded_video_bytes(source, reader_cache_size=reader_cache_size)
+    tensor = _read_video_clips_dali(
+        [source],
+        clip_start=[max(0, int(clip_start))],
+        clip_len=[target_len],
+        stride=[max(1, int(stride))],
+        image_size=image_size,
+        reader_cache_size=reader_cache_size,
+    )
+    return tensor[0]
+
+
+def _read_video_clips_dali(
+    paths: Sequence[Path],
+    *,
+    clip_start: Sequence[int],
+    clip_len: Sequence[int | None],
+    stride: Sequence[int],
+    image_size: int,
+    reader_cache_size: int,
+) -> torch.Tensor:
+    if not paths:
+        return torch.empty((0, 0, 3, image_size, image_size), dtype=torch.float32)
+    start_values = [max(0, int(value)) for value in clip_start]
+    stride_values = [max(1, int(value)) for value in stride]
+    target_lens: list[int] = []
+    for source, start_value, requested_len, stride_value in zip(paths, start_values, clip_len, stride_values):
+        if requested_len is None:
+            frame_count = get_video_frame_count(source, reader_cache_size=reader_cache_size, video_backend="decord")
+            resolved_len = max(0, (frame_count - start_value + stride_value - 1) // stride_value)
+        else:
+            resolved_len = int(requested_len)
+        target_lens.append(resolved_len)
+    if not target_lens or max(target_lens) <= 0:
+        return torch.empty((len(paths), 0, 3, image_size, image_size), dtype=torch.float32)
+    encoded = [_get_encoded_video_bytes(source, reader_cache_size=reader_cache_size) for source in paths]
     device_id = torch.cuda.current_device() if torch.cuda.is_available() else 0
     pipeline = _get_dali_pipeline(
         image_size=image_size,
         device_id=device_id,
+        batch_size=len(paths),
         reader_cache_size=reader_cache_size,
     )
     frames = pipeline.run(
         encoded=encoded,
-        start_frame=max(0, int(clip_start)),
-        sequence_length=target_len,
-        stride=max(1, int(stride)),
+        start_frame=start_values,
+        sequence_length=target_lens,
+        stride=stride_values,
     )
     if hasattr(frames, "as_tensor"):
         frames = frames.as_tensor()
@@ -243,14 +284,103 @@ def _read_video_clip_dali(
         tensor = torch.utils.dlpack.from_dlpack(frames)
     except Exception:
         tensor = torch.from_numpy(frames.as_cpu().as_array())
-    if tensor.ndim == 5:
-        tensor = tensor[0]
-    if tensor.ndim != 4:
-        raise ValueError(f"Unexpected DALI output shape: {tuple(tensor.shape)}")
+    if tensor.ndim != 5:
+        raise ValueError(f"Unexpected DALI batch output shape: {tuple(tensor.shape)}")
     if tensor.dtype != torch.float32:
         tensor = tensor.float()
-    tensor = tensor.permute(0, 3, 1, 2).contiguous() / 255.0
-    return _pad_clip_tensor(tensor, target_len)
+    tensor = tensor.permute(0, 1, 4, 2, 3).contiguous() / 255.0
+    clips: list[torch.Tensor] = []
+    for batch_idx, target_len in enumerate(target_lens):
+        clip = tensor[batch_idx]
+        if clip.shape[0] > target_len:
+            clip = clip[:target_len]
+        clip = _pad_clip_tensor(clip, target_len)
+        clips.append(clip)
+    return torch.stack(clips, dim=0)
+
+
+def _read_video_clips_mixed(
+    paths: Sequence[Path],
+    *,
+    clip_start: Sequence[int],
+    clip_len: Sequence[int | None],
+    stride: Sequence[int],
+    image_size: int,
+    reader_cache_size: int,
+    video_backend: str,
+) -> torch.Tensor:
+    clips = [
+        read_video_clip(
+            source,
+            clip_start=int(start),
+            clip_len=None if length is None else int(length),
+            stride=int(step),
+            image_size=image_size,
+            reader_cache_size=reader_cache_size,
+            video_backend=video_backend,
+        )
+        for source, start, length, step in zip(paths, clip_start, clip_len, stride)
+    ]
+    if not clips:
+        return torch.empty((0, 0, 3, image_size, image_size), dtype=torch.float32)
+    target_len = max((clip.shape[0] for clip in clips), default=0)
+    return torch.stack([_pad_clip_tensor(clip, target_len) for clip in clips], dim=0)
+
+
+def read_video_clips(
+    paths: Sequence[str | Path],
+    *,
+    clip_start: Sequence[int],
+    clip_len: Sequence[int | None],
+    stride: Sequence[int],
+    image_size: int = 384,
+    reader_cache_size: int = _DEFAULT_READER_CACHE_SIZE,
+    video_backend: str = _DEFAULT_VIDEO_BACKEND,
+) -> torch.Tensor:
+    sources = [Path(path) for path in paths]
+    if not (len(sources) == len(clip_start) == len(clip_len) == len(stride)):
+        raise ValueError("read_video_clips requires matching sequence lengths")
+    if not sources:
+        return torch.empty((0, 0, 3, image_size, image_size), dtype=torch.float32)
+    backend = _resolve_backend(source=sources[0], video_backend=video_backend)
+    if any(_resolve_backend(source=source, video_backend=video_backend) != backend for source in sources[1:]):
+        return _read_video_clips_mixed(
+            sources,
+            clip_start=clip_start,
+            clip_len=clip_len,
+            stride=stride,
+            image_size=image_size,
+            reader_cache_size=reader_cache_size,
+            video_backend=video_backend,
+        )
+    if backend == "dali":
+        return _read_video_clips_dali(
+            sources,
+            clip_start=clip_start,
+            clip_len=clip_len,
+            stride=stride,
+            image_size=image_size,
+            reader_cache_size=reader_cache_size,
+        )
+    if backend == "tensor":
+        return _read_video_clips_mixed(
+            sources,
+            clip_start=clip_start,
+            clip_len=clip_len,
+            stride=stride,
+            image_size=image_size,
+            reader_cache_size=reader_cache_size,
+            video_backend=video_backend,
+        )
+    return _read_video_clips_mixed(
+        sources,
+        clip_start=clip_start,
+        clip_len=clip_len,
+        stride=stride,
+        image_size=image_size,
+        reader_cache_size=reader_cache_size,
+        video_backend=video_backend,
+    )
 
 
 def read_video_clip(
