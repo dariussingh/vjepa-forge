@@ -1,3 +1,3 @@
-from vjepa_forge.engine.validator import BaseValidator as SegmentValidator
+from .runtime import SegmentValidator
 
 __all__ = ["SegmentValidator"]

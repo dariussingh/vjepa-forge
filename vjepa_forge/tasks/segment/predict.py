@@ -1,3 +1,3 @@
-from vjepa_forge.engine.predictor import BasePredictor as SegmentPredictor
+from .runtime import SegmentPredictor
 
 __all__ = ["SegmentPredictor"]

@@ -1,3 +1,3 @@
-from vjepa_forge.engine.predictor import BasePredictor as DetectPredictor
+from .runtime import DetectPredictor
 
 __all__ = ["DetectPredictor"]

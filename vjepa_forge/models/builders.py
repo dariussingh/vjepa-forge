@@ -21,9 +21,9 @@ def build_head(task: str, media: str, model_cfg: dict, embed_dim: int) -> nn.Mod
     if task == "classify":
         return ForgeClassificationHead(embed_dim, num_classes, media)
     if task == "detect":
-        return ForgeDetectHead(embed_dim, num_classes, media, num_queries=int(head_cfg.get("num_queries", 100)))
+        return ForgeDetectHead(embed_dim, num_classes, media, model_cfg=model_cfg, num_queries=int(head_cfg.get("num_queries", 100)))
     if task == "segment":
-        return ForgeSegmentHead(embed_dim, num_classes, media)
+        return ForgeSegmentHead(embed_dim, num_classes, media, model_cfg=model_cfg)
     if task == "anomaly":
         return ForgeAnomalyHead(embed_dim, media)
     raise ValueError(f"Unsupported task: {task}")

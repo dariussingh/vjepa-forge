@@ -1,3 +1,3 @@
-from vjepa_forge.engine.trainer import BaseTrainer as SegmentTrainer
+from .runtime import SegmentTrainer
 
 __all__ = ["SegmentTrainer"]

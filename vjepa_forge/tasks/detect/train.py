@@ -1,3 +1,3 @@
-from vjepa_forge.engine.trainer import BaseTrainer as DetectTrainer
+from .runtime import DetectTrainer
 
 __all__ = ["DetectTrainer"]

@@ -1,3 +1,3 @@
-from vjepa_forge.engine.validator import BaseValidator as DetectValidator
+from .runtime import DetectValidator
 
 __all__ = ["DetectValidator"]

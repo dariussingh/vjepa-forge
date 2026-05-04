@@ -9,7 +9,8 @@ import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 from torchvision.ops import generalized_box_iou
 
-from vjepa_forge.backbones.vjepa21 import BACKBONE_SPECS, VJEPAEnhancedPyramidAdapter, VJEPAImageBackbone
+from vjepa_forge.backbones.vjepa21 import BACKBONE_SPECS, VJEPAEnhancedPyramidAdapter, VJEPAFeaturePyramidAdapter, VJEPAImageBackbone
+from .box_ops import batched_nms_xyxy
 
 
 def box_cxcywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
@@ -352,3 +353,160 @@ def prepare_targets(targets: list[dict[str, torch.Tensor]], imgsz: int) -> list[
             boxes = box_xyxy_to_cxcywh(boxes)
         prepared.append({"boxes": boxes, "labels": target["labels"]})
     return prepared
+
+
+class ForgeRFDETRHead(nn.Module):
+    """Reimplements the required RF-DETR-style query head for Forge using V-JEPA feature maps."""
+
+    expects_image_input = False
+
+    def __init__(
+        self,
+        input_dim: int,
+        num_classes: int,
+        media: str,
+        *,
+        hidden_dim: int = 256,
+        num_queries: int = 100,
+        num_heads: int = 8,
+        num_decoder_layers: int = 6,
+    ) -> None:
+        super().__init__()
+        self.media = media
+        self.num_classes = int(num_classes)
+        self.hidden_dim = int(hidden_dim)
+        self.adapter = VJEPAFeaturePyramidAdapter(input_dim, out_channels=self.hidden_dim)
+        self.input_proj = nn.ModuleList([nn.Conv2d(self.hidden_dim, self.hidden_dim, kernel_size=1) for _ in range(3)])
+        self.level_embed = nn.Parameter(torch.zeros(3, self.hidden_dim))
+        self.query_embed = nn.Embedding(int(num_queries), self.hidden_dim)
+        self.decoder = RFDETRDecoder(self.hidden_dim, int(num_heads), 3, int(num_decoder_layers))
+        self.class_head = nn.Linear(self.hidden_dim, self.num_classes + 1)
+        self.box_head = MLP(self.hidden_dim, self.hidden_dim, 4, 3)
+        self.matcher = HungarianMatcher()
+        self.criterion = SetCriterion(
+            num_classes=self.num_classes,
+            matcher=self.matcher,
+            weight_dict={"loss_ce": 1.0, "loss_bbox": 5.0, "loss_giou": 2.0},
+        )
+        nn.init.normal_(self.level_embed, std=0.02)
+
+    def _flatten_video_features(self, features: list[torch.Tensor]) -> tuple[list[torch.Tensor], tuple[int, int] | None]:
+        if self.media != "video":
+            return features, None
+        batch = int(features[0].shape[0])
+        time = int(features[0].shape[2])
+        flattened = [feature.permute(0, 2, 1, 3, 4).reshape(batch * time, feature.shape[1], feature.shape[3], feature.shape[4]) for feature in features]
+        return flattened, (batch, time)
+
+    def forward(self, features: list[torch.Tensor]) -> dict[str, torch.Tensor | list[dict[str, torch.Tensor]]]:
+        features_in, video_shape = self._flatten_video_features(features)
+        pyramid = self.adapter(features_in)
+        memories: list[torch.Tensor] = []
+        pos_embeds: list[torch.Tensor] = []
+        for level_idx, (feature, input_proj) in enumerate(zip(pyramid, self.input_proj, strict=True)):
+            projected = input_proj(feature)
+            batch_size, channels, height, width = projected.shape
+            memory = projected.flatten(2).transpose(1, 2)
+            pos = build_sine_position_embedding(height, width, channels, feature.device, feature.dtype)
+            memories.append(memory + self.level_embed[level_idx].view(1, 1, -1))
+            pos_embeds.append(pos)
+        batch_size = memories[0].shape[0]
+        query_embed = self.query_embed.weight.unsqueeze(0).expand(batch_size, -1, -1)
+        queries = torch.zeros_like(query_embed)
+        decoder_outputs = self.decoder(queries, memories, pos_embeds, query_embed)
+        logits = [self.class_head(output) for output in decoder_outputs]
+        boxes = [self.box_head(output).sigmoid() for output in decoder_outputs]
+        pred_logits = logits[-1]
+        pred_boxes = boxes[-1]
+        aux_outputs: list[dict[str, torch.Tensor]] = [{"pred_logits": l, "pred_boxes": b} for l, b in zip(logits[:-1], boxes[:-1], strict=True)]
+        if video_shape is not None:
+            batch, time = video_shape
+            pred_logits = pred_logits.view(batch, time, pred_logits.shape[1], pred_logits.shape[2])
+            pred_boxes = pred_boxes.view(batch, time, pred_boxes.shape[1], pred_boxes.shape[2])
+            aux_outputs = [
+                {
+                    "pred_logits": aux["pred_logits"].view(batch, time, aux["pred_logits"].shape[1], aux["pred_logits"].shape[2]),
+                    "pred_boxes": aux["pred_boxes"].view(batch, time, aux["pred_boxes"].shape[1], aux["pred_boxes"].shape[2]),
+                }
+                for aux in aux_outputs
+            ]
+        return {"pred_logits": pred_logits, "pred_boxes": pred_boxes, "aux_outputs": aux_outputs}
+
+    def _prepare_targets(self, labels: dict[str, Any], device: torch.device, *, video_frames: int | None = None) -> list[dict[str, torch.Tensor]]:
+        prepared: list[dict[str, torch.Tensor]] = []
+        for item in labels["detections"]:
+            detections = item["detections"]
+            if video_frames is None:
+                classes = torch.tensor([int(ann["class_id"]) for ann in detections], dtype=torch.int64, device=device) if detections else torch.empty(0, dtype=torch.int64, device=device)
+                boxes = torch.tensor([ann["box"] for ann in detections], dtype=torch.float32, device=device) if detections else torch.empty(0, 4, dtype=torch.float32, device=device)
+                prepared.append({"labels": classes, "boxes": boxes})
+                continue
+            grouped: dict[int, list[dict[str, Any]]] = {}
+            for det in detections:
+                grouped.setdefault(int(det["frame_idx"]), []).append(det)
+            for frame_idx in range(video_frames):
+                frame_dets = grouped.get(frame_idx, [])
+                classes = torch.tensor([int(ann["class_id"]) for ann in frame_dets], dtype=torch.int64, device=device) if frame_dets else torch.empty(0, dtype=torch.int64, device=device)
+                boxes = torch.tensor([ann["box"] for ann in frame_dets], dtype=torch.float32, device=device) if frame_dets else torch.empty(0, 4, dtype=torch.float32, device=device)
+                prepared.append({"labels": classes, "boxes": boxes})
+        return prepared
+
+    def compute_loss(self, outputs: dict[str, Any], labels: dict[str, Any]) -> tuple[torch.Tensor, dict[str, float]]:
+        if outputs["pred_logits"].ndim == 4:
+            time = int(outputs["pred_logits"].shape[1])
+            flat_outputs = {
+                "pred_logits": outputs["pred_logits"].reshape(-1, outputs["pred_logits"].shape[-2], outputs["pred_logits"].shape[-1]),
+                "pred_boxes": outputs["pred_boxes"].reshape(-1, outputs["pred_boxes"].shape[-2], outputs["pred_boxes"].shape[-1]),
+                "aux_outputs": [
+                    {
+                        "pred_logits": aux["pred_logits"].reshape(-1, aux["pred_logits"].shape[-2], aux["pred_logits"].shape[-1]),
+                        "pred_boxes": aux["pred_boxes"].reshape(-1, aux["pred_boxes"].shape[-2], aux["pred_boxes"].shape[-1]),
+                    }
+                    for aux in outputs.get("aux_outputs", [])
+                ],
+            }
+            targets = self._prepare_targets(labels, flat_outputs["pred_logits"].device, video_frames=time)
+        else:
+            flat_outputs = outputs
+            targets = self._prepare_targets(labels, outputs["pred_logits"].device)
+        losses = self.criterion(flat_outputs, targets)
+        total = sum(self.criterion.weight_dict.get(name.split("_")[0], 1.0) * value for name, value in losses.items())
+        stats = {name: float(value.detach().cpu().item()) for name, value in losses.items()}
+        return total, stats
+
+    def decode_predictions(
+        self,
+        outputs: dict[str, Any],
+        *,
+        score_threshold: float = 0.25,
+        iou_threshold: float = 0.5,
+        max_detections: int = 100,
+    ) -> list[dict[str, torch.Tensor]]:
+        if outputs["pred_logits"].ndim == 4:
+            logits = outputs["pred_logits"].reshape(-1, outputs["pred_logits"].shape[-2], outputs["pred_logits"].shape[-1])
+            boxes = outputs["pred_boxes"].reshape(-1, outputs["pred_boxes"].shape[-2], outputs["pred_boxes"].shape[-1])
+        else:
+            logits = outputs["pred_logits"]
+            boxes = outputs["pred_boxes"]
+        decoded: list[dict[str, torch.Tensor]] = []
+        for pred_logits, pred_boxes in zip(logits, boxes, strict=True):
+            probs = pred_logits.softmax(dim=-1)[..., :-1]
+            scores, labels = probs.max(dim=-1)
+            keep = scores >= float(score_threshold)
+            if not keep.any():
+                decoded.append({"scores": scores.new_empty(0), "labels": labels.new_empty(0), "boxes": pred_boxes.new_empty((0, 4))})
+                continue
+            kept_scores = scores[keep]
+            kept_labels = labels[keep]
+            kept_boxes = box_cxcywh_to_xyxy(pred_boxes[keep])
+            final_indices: list[torch.Tensor] = []
+            for class_id in kept_labels.unique():
+                class_mask = kept_labels == class_id
+                class_keep = batched_nms_xyxy(kept_boxes[class_mask], kept_scores[class_mask], iou_threshold)
+                source_idx = torch.nonzero(class_mask, as_tuple=False).squeeze(1)[class_keep]
+                final_indices.append(source_idx)
+            keep_idx = torch.cat(final_indices, dim=0) if final_indices else kept_scores.new_empty(0, dtype=torch.int64)
+            if keep_idx.numel() > max_detections:
+                keep_idx = keep_idx[torch.argsort(kept_scores[keep_idx], descending=True)[:max_detections]]
+            decoded.append({"scores": kept_scores[keep_idx], "labels": kept_labels[keep_idx], "boxes": kept_boxes[keep_idx]})
+        return decoded
