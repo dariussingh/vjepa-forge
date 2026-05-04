@@ -16,6 +16,7 @@ dependencies = [
   "einops",
   "timm",
   "Pillow",
+  "opencv-python",
   "decord",
 ]
 

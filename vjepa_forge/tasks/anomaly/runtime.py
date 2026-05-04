@@ -8,13 +8,14 @@ import random
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
 from vjepa_forge.data.forge.dataset import ForgeDataset
-from vjepa_forge.data.video import get_video_frame_count, read_video_clip
+from vjepa_forge.data.video import get_video_frame_count, read_video_clip, read_video_frames_uint8
 from vjepa_forge.engine.checkpointing import checkpoint_paths, checkpoint_payload, load_checkpoint, resolve_resume_path, resolve_run_dir, results_csv_rows, save_checkpoint, write_results_csv
 from vjepa_forge.heads.anomaly.modeling import ExtractedFeatures, build_feature_extractor, build_predictor
 
@@ -57,9 +58,10 @@ class AnomalyValidationResult:
 
 @dataclass
 class AnomalyPredictResult:
-    split: str
+    split: str | None
     metrics: dict[str, Any]
     report_path: str
+    rendered_outputs: list[str] | None = None
 
 
 @dataclass
@@ -152,9 +154,10 @@ def _resolve_device(device_str: str) -> torch.device:
 
 
 def _make_output_root(cfg: dict[str, Any]) -> Path:
+    source = cfg.get("predict", {}).get("source") if cfg.get("action") == "predict" else None
     return resolve_run_dir(
         task="anomaly",
-        data=cfg["dataset"]["dataset_yaml"],
+        data=source or cfg["dataset"]["dataset_yaml"],
         project=cfg["train"].get("project") or cfg.get("output", {}).get("root"),
         name=cfg["train"].get("name"),
         exist_ok=bool(cfg["train"].get("exist_ok", False) or cfg.get("action") != "train"),
@@ -186,14 +189,15 @@ def _build_cfg(config: dict[str, Any], *, action: str) -> dict[str, Any]:
     backbone_cfg = dict(model_cfg.get("backbone", {}))
     data_cfg = dict(config["data"])
     dataset_yaml = data_cfg.get("_path") or data_cfg.get("dataset_yaml") or data_cfg.get("path")
-    if not dataset_yaml:
+    source = config.get("predict", {}).get("source")
+    if not dataset_yaml and not (action == "predict" and source):
         raise ValueError("Anomaly runtime requires data._path or data.dataset_yaml")
     output_root = config.get("output", {}).get("root")
     default_workers = max(1, min(8, os.cpu_count() or 1))
     return {
         "action": action,
         "dataset": {
-            "dataset_yaml": str(dataset_yaml),
+            "dataset_yaml": None if dataset_yaml is None else str(dataset_yaml),
             "image_size": int(data_cfg.get("image_size", 384)),
             "past_frames": int(data_cfg.get("past_frames", data_cfg.get("num_frames", 8))),
             "future_frames": int(data_cfg.get("future_frames", data_cfg.get("num_frames", 8))),
@@ -252,6 +256,15 @@ def _build_cfg(config: dict[str, Any], *, action: str) -> dict[str, Any]:
             "checkpoint_path": config["val"].get("checkpoint_path"),
             "split": str(config["val"].get("split", "val" if action == "val" else "test")),
         },
+        "predict": {
+            "batch_size": int(config.get("predict", {}).get("batch_size", config["val"].get("batch_size", 1))),
+            "num_workers": int(config.get("predict", {}).get("num_workers", config["val"].get("num_workers", default_workers))),
+            "split": str(config.get("predict", {}).get("split", "test")),
+            "threshold": config.get("predict", {}).get("threshold"),
+            "visualize": bool(config.get("predict", {}).get("visualize", False)),
+            "source": source,
+            "output_dir": config.get("predict", {}).get("output_dir"),
+        },
         "export": {
             "format": str(config["export"].get("format", "onnx")),
             "output_path": str(config["export"].get("output_path", "anomaly.onnx")),
@@ -292,6 +305,17 @@ def _build_video_records(dataset_yaml: str | Path, split: str) -> list[VideoClip
             )
         )
     return records
+
+
+def _build_source_record(source: str | Path, *, video_backend: str) -> VideoClipRecord:
+    source_path = Path(source)
+    frame_count = get_video_frame_count(source_path, reader_cache_size=4, video_backend=video_backend)
+    return VideoClipRecord(
+        name=source_path.stem,
+        media_path=str(source_path),
+        frame_count=frame_count,
+        frame_labels=None,
+    )
 
 
 def _build_window_records(videos: list[VideoClipRecord], past_frames: int, future_frames: int, stride: int) -> list[WindowRecord]:
@@ -375,6 +399,38 @@ def _make_loaders(cfg: dict[str, Any], include_test: bool = True) -> dict[str, A
     if test_ds is not None:
         loaders["test_loader"] = DataLoader(test_ds, **eval_loader_kwargs)
     return loaders
+
+
+def _build_eval_loader(
+    videos: list[VideoClipRecord],
+    cfg: dict[str, Any],
+    *,
+    batch_size: int | None = None,
+    num_workers: int | None = None,
+) -> DataLoader:
+    dataset_cfg = cfg["dataset"]
+    windows = _build_window_records(
+        videos,
+        past_frames=dataset_cfg["past_frames"],
+        future_frames=dataset_cfg["future_frames"],
+        stride=dataset_cfg["stride"],
+    )
+    video_backend = str(dataset_cfg.get("video_backend", "auto"))
+    ds = ForgeAnomalyWindowDataset(videos, windows, dataset_cfg["image_size"], video_backend=video_backend)
+    ds.reader_cache_size = int(cfg["eval"]["reader_cache_size"])
+    worker_count = int(cfg["eval"]["num_workers"] if num_workers is None else num_workers)
+    if video_backend == "dali":
+        worker_count = 0
+    loader_kwargs = {
+        "batch_size": int(cfg["eval"]["batch_size"] if batch_size is None else batch_size),
+        "shuffle": False,
+        "num_workers": worker_count,
+        "pin_memory": bool(cfg["eval"]["pin_memory"] and video_backend != "dali"),
+    }
+    if worker_count > 0:
+        loader_kwargs["persistent_workers"] = bool(cfg["eval"]["persistent_workers"])
+        loader_kwargs["prefetch_factor"] = int(cfg["eval"]["prefetch_factor"])
+    return DataLoader(ds, **loader_kwargs)
 
 
 def _extract_pair_features(feature_extractor: nn.Module, batch: dict[str, Any], device: torch.device) -> tuple[ExtractedFeatures, ExtractedFeatures]:
@@ -488,7 +544,7 @@ def _aggregate_scores(loader: DataLoader, predictor: nn.Module, feature_extracto
         labels_np = labels.numpy() if labels is not None else None
         video_names = batch["video_name"]
         for i, video_name in enumerate(video_names):
-            state = by_video.setdefault(video_name, {"predictor_sum": {}, "predictor_count": {}, "frozen_sum": {}, "frozen_count": {}, "labels": {}})
+            state = by_video.setdefault(video_name, {"predictor_sum": {}, "predictor_count": {}, "frozen_sum": {}, "frozen_count": {}, "labels": {}, "has_labels": False})
             for local_idx, frame_idx in enumerate(future_indices[i]):
                 idx = int(frame_idx)
                 state["predictor_sum"][idx] = state["predictor_sum"].get(idx, 0.0) + float(predictor_scores[i, local_idx])
@@ -496,6 +552,7 @@ def _aggregate_scores(loader: DataLoader, predictor: nn.Module, feature_extracto
                 state["frozen_sum"][idx] = state["frozen_sum"].get(idx, 0.0) + float(frozen_scores[i, local_idx])
                 state["frozen_count"][idx] = state["frozen_count"].get(idx, 0) + 1
             if labels_np is not None:
+                state["has_labels"] = True
                 for frame_idx, label in zip(future_indices[i], labels_np[i]):
                     state["labels"][int(frame_idx)] = int(label)
     summary: dict[str, Any] = {"videos": {}}
@@ -503,12 +560,14 @@ def _aggregate_scores(loader: DataLoader, predictor: nn.Module, feature_extracto
         frame_ids = sorted(state["predictor_sum"].keys())
         predictor_series = np.asarray([state["predictor_sum"][idx] / state["predictor_count"][idx] for idx in frame_ids], dtype=np.float32)
         frozen_series = np.asarray([state["frozen_sum"][idx] / state["frozen_count"][idx] for idx in frame_ids], dtype=np.float32)
-        labels = np.asarray([state["labels"].get(idx, 0) for idx in frame_ids], dtype=np.int64)
+        labels = None
+        if state["has_labels"]:
+            labels = np.asarray([state["labels"].get(idx, 0) for idx in frame_ids], dtype=np.int64)
         summary["videos"][video_name] = {
             "frame_ids": frame_ids,
             "predictor_scores": predictor_series.tolist(),
             "frozen_scores": frozen_series.tolist(),
-            "labels": labels.tolist(),
+            "labels": None if labels is None else labels.tolist(),
         }
     return summary
 
@@ -517,6 +576,8 @@ def _flatten_metric_arrays(video_summary: dict[str, Any], key: str) -> tuple[np.
     scores: list[float] = []
     labels: list[int] = []
     for video in video_summary["videos"].values():
+        if video["labels"] is None:
+            continue
         scores.extend(video[key])
         labels.extend(video["labels"])
     return np.asarray(labels, dtype=np.int64), np.asarray(scores, dtype=np.float32)
@@ -534,6 +595,177 @@ def _build_smoothed_summary(video_summary: dict[str, Any], smoothing_window: int
             "labels": payload["labels"],
         }
     return smoothed
+
+
+def _safe_div(numerator: float, denominator: float) -> float:
+    if denominator == 0:
+        return 0.0
+    return float(numerator / denominator)
+
+
+def _clip_score_rows(video_summary: dict[str, Any], key: str, *, reduction: str = "max") -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for video_name, payload in video_summary["videos"].items():
+        scores = np.asarray(payload[key], dtype=np.float32)
+        labels = None if payload["labels"] is None else np.asarray(payload["labels"], dtype=np.int64)
+        if reduction == "max":
+            clip_score = float(scores.max()) if scores.size else float("nan")
+        elif reduction == "mean":
+            clip_score = float(scores.mean()) if scores.size else float("nan")
+        else:
+            raise ValueError(f"Unsupported clip score reduction: {reduction}")
+        clip_label = None if labels is None else int(np.any(labels != 0))
+        rows.append(
+            {
+                "video_name": video_name,
+                "clip_label": clip_label,
+                "clip_score": clip_score,
+            }
+        )
+    return rows
+
+
+def _clip_level_metrics(video_summary: dict[str, Any], key: str, *, threshold: float, reduction: str = "max") -> dict[str, Any]:
+    rows = _clip_score_rows(video_summary, key, reduction=reduction)
+    labeled_rows = [row for row in rows if row["clip_label"] is not None]
+    labels = np.asarray([row["clip_label"] for row in labeled_rows], dtype=np.int64)
+    scores = np.asarray([row["clip_score"] for row in labeled_rows], dtype=np.float32)
+    predictions = (scores > float(threshold)).astype(np.int64)
+    tp = int(np.sum((labels == 1) & (predictions == 1)))
+    fn = int(np.sum((labels == 1) & (predictions == 0)))
+    tn = int(np.sum((labels == 0) & (predictions == 0)))
+    fp = int(np.sum((labels == 0) & (predictions == 1)))
+    precision = _safe_div(tp, tp + fp)
+    recall = _safe_div(tp, tp + fn)
+    specificity = _safe_div(tn, tn + fp)
+    accuracy = _safe_div(tp + tn, len(rows))
+    f1 = _safe_div(2.0 * precision * recall, precision + recall) if (precision + recall) > 0.0 else 0.0
+    return {
+        "reduction": reduction,
+        "auc": _roc_auc_score(labels, scores),
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "specificity": specificity,
+        "f1": f1,
+        "confusion_matrix": {"tn": tn, "fp": fp, "fn": fn, "tp": tp},
+        "counts": {
+            "total": int(len(labeled_rows)),
+            "normal": int(np.sum(labels == 0)),
+            "anomaly": int(np.sum(labels == 1)),
+        },
+        "clips": rows,
+    }
+
+
+def _threshold_clip_predictions(video_summary: dict[str, Any], key: str, *, threshold: float, reduction: str = "max") -> dict[str, Any]:
+    rows = _clip_score_rows(video_summary, key, reduction=reduction)
+    enriched: list[dict[str, Any]] = []
+    for row in rows:
+        label = row["clip_label"]
+        clip_score = float(row["clip_score"])
+        predicted_label = int(clip_score > float(threshold))
+        enriched.append(
+            {
+                "video_name": row["video_name"],
+                "clip_score": clip_score,
+                "clip_label": label,
+                "predicted_label": predicted_label,
+                "threshold": float(threshold),
+            }
+        )
+    return {
+        "clip_score_reduction": reduction,
+        "threshold": float(threshold),
+        "clips": enriched,
+    }
+
+
+def _predict_output_root(cfg: dict[str, Any], *, split: str | None, source: str | None) -> Path:
+    output_root = _make_output_root(cfg)
+    base = output_root / "predict"
+    if source:
+        return base / Path(source).stem
+    return base / str(split or "custom")
+
+
+def _render_timeline_strip(
+    image: np.ndarray,
+    *,
+    scores: np.ndarray,
+    current_index: int,
+    threshold: float,
+    labels: np.ndarray | None,
+) -> np.ndarray:
+    height, width = image.shape[:2]
+    strip_h = max(28, height // 10)
+    y0 = height - strip_h - 8
+    x0 = 8
+    x1 = width - 8
+    overlay = image.copy()
+    cv2.rectangle(overlay, (x0, y0), (x1, y0 + strip_h), (15, 15, 15), -1)
+    image = cv2.addWeighted(overlay, 0.35, image, 0.65, 0.0)
+    if labels is not None and labels.size:
+        for idx, value in enumerate(labels):
+            if int(value) <= 0:
+                continue
+            px0 = int(x0 + idx * (x1 - x0) / max(labels.size, 1))
+            px1 = int(x0 + (idx + 1) * (x1 - x0) / max(labels.size, 1))
+            cv2.rectangle(image, (px0, y0), (px1, y0 + strip_h), (40, 60, 180), -1)
+    if scores.size:
+        vmax = max(float(scores.max()), threshold, 1e-6)
+        points = []
+        for idx, score in enumerate(scores):
+            px = int(x0 + idx * (x1 - x0) / max(scores.size - 1, 1))
+            py = int(y0 + strip_h - 4 - (float(score) / vmax) * max(strip_h - 8, 1))
+            points.append((px, py))
+        if len(points) > 1:
+            cv2.polylines(image, [np.asarray(points, dtype=np.int32)], False, (255, 220, 0), 2)
+        tx_y = int(y0 + strip_h - 4 - (float(threshold) / vmax) * max(strip_h - 8, 1))
+        cv2.line(image, (x0, tx_y), (x1, tx_y), (0, 0, 255), 1)
+        cx = int(x0 + current_index * (x1 - x0) / max(scores.size - 1, 1))
+        cv2.line(image, (cx, y0), (cx, y0 + strip_h), (255, 255, 255), 1)
+    return image
+
+
+def _render_prediction_video(
+    *,
+    source_path: str,
+    output_path: Path,
+    predictor_scores: list[float],
+    threshold: float,
+    labels: list[int] | None,
+) -> None:
+    frames = read_video_frames_uint8(source_path)
+    if frames.size == 0:
+        raise RuntimeError(f"No frames available for visualization: {source_path}")
+    frame_count = min(len(frames), len(predictor_scores))
+    frames = frames[:frame_count]
+    scores = np.asarray(predictor_scores[:frame_count], dtype=np.float32)
+    label_arr = None if labels is None else np.asarray(labels[:frame_count], dtype=np.int64)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    height, width = frames.shape[1], frames.shape[2]
+    writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), 25.0, (width, height))
+    if not writer.isOpened():
+        raise RuntimeError(f"Failed to open video writer for {output_path}")
+    try:
+        for idx in range(frame_count):
+            rgb = frames[idx].copy()
+            score = float(scores[idx])
+            predicted = score > float(threshold)
+            if label_arr is not None and int(label_arr[idx]) > 0:
+                overlay = rgb.copy()
+                cv2.rectangle(overlay, (0, 0), (width, height), (255, 96, 96), -1)
+                rgb = cv2.addWeighted(overlay, 0.12, rgb, 0.88, 0.0)
+            status = "ANOMALY" if predicted else "NORMAL"
+            color = (0, 0, 255) if predicted else (0, 200, 0)
+            cv2.putText(rgb, f"score={score:.4f}", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(rgb, f"threshold={float(threshold):.4f}", (12, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(rgb, status, (12, 86), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2, cv2.LINE_AA)
+            rgb = _render_timeline_strip(rgb, scores=scores, current_index=idx, threshold=float(threshold), labels=label_arr)
+            writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+    finally:
+        writer.release()
 
 
 def _checkpoint_payload(predictor: nn.Module, cfg: dict[str, Any], *, epoch: int, train_loss: float, val_loss: float, best_val_loss: float, effective_lr: float, checkpoint_kind: str) -> dict[str, Any]:
@@ -741,6 +973,10 @@ def _run_eval(config: dict[str, Any], *, split: str) -> tuple[dict[str, Any], Pa
     _, val_scores_frozen = _flatten_metric_arrays(smoothed, "frozen_scores")
     pred_stats = _normal_stats(val_scores_pred[val_labels == 0] if np.any(val_labels == 0) else val_scores_pred)
     frozen_stats = _normal_stats(val_scores_frozen[val_labels == 0] if np.any(val_labels == 0) else val_scores_frozen)
+    predictor_threshold = float(pred_stats["mean"] + cfg["eval"]["threshold_std_multiplier"] * pred_stats["std"])
+    frozen_threshold = float(frozen_stats["mean"] + cfg["eval"]["threshold_std_multiplier"] * frozen_stats["std"])
+    predictor_clip = _clip_level_metrics(smoothed, "predictor_scores", threshold=predictor_threshold, reduction="max")
+    frozen_clip = _clip_level_metrics(smoothed, "frozen_scores", threshold=frozen_threshold, reduction="max")
     metrics = {
         "split": split,
         "predictor_type": cfg["model"]["predictor_type"],
@@ -748,10 +984,27 @@ def _run_eval(config: dict[str, Any], *, split: str) -> tuple[dict[str, Any], Pa
         "frozen_diff_frame_auc_raw": _roc_auc_score(labels_raw, scores_frozen_raw),
         "predictor_frame_auc": _roc_auc_score(labels, scores_pred),
         "frozen_diff_frame_auc": _roc_auc_score(labels, scores_frozen),
-        "predictor_threshold": float(pred_stats["mean"] + cfg["eval"]["threshold_std_multiplier"] * pred_stats["std"]),
-        "frozen_threshold": float(frozen_stats["mean"] + cfg["eval"]["threshold_std_multiplier"] * frozen_stats["std"]),
-        "predictor_val_false_positive_rate": float(np.mean(val_scores_pred > (pred_stats["mean"] + cfg["eval"]["threshold_std_multiplier"] * pred_stats["std"]))) if len(val_scores_pred) else 0.0,
-        "frozen_val_false_positive_rate": float(np.mean(val_scores_frozen > (frozen_stats["mean"] + cfg["eval"]["threshold_std_multiplier"] * frozen_stats["std"]))) if len(val_scores_frozen) else 0.0,
+        "predictor_threshold": predictor_threshold,
+        "frozen_threshold": frozen_threshold,
+        "predictor_val_false_positive_rate": float(np.mean(val_scores_pred > predictor_threshold)) if len(val_scores_pred) else 0.0,
+        "frozen_val_false_positive_rate": float(np.mean(val_scores_frozen > frozen_threshold)) if len(val_scores_frozen) else 0.0,
+        "clip_score_reduction": "max",
+        "predictor_clip_auc": predictor_clip["auc"],
+        "frozen_diff_clip_auc": frozen_clip["auc"],
+        "predictor_clip_accuracy": predictor_clip["accuracy"],
+        "predictor_clip_precision": predictor_clip["precision"],
+        "predictor_clip_recall": predictor_clip["recall"],
+        "predictor_clip_specificity": predictor_clip["specificity"],
+        "predictor_clip_f1": predictor_clip["f1"],
+        "predictor_clip_confusion_matrix": predictor_clip["confusion_matrix"],
+        "predictor_clip_counts": predictor_clip["counts"],
+        "frozen_diff_clip_accuracy": frozen_clip["accuracy"],
+        "frozen_diff_clip_precision": frozen_clip["precision"],
+        "frozen_diff_clip_recall": frozen_clip["recall"],
+        "frozen_diff_clip_specificity": frozen_clip["specificity"],
+        "frozen_diff_clip_f1": frozen_clip["f1"],
+        "frozen_diff_clip_confusion_matrix": frozen_clip["confusion_matrix"],
+        "frozen_diff_clip_counts": frozen_clip["counts"],
         "smoothing_window": int(cfg["eval"].get("smoothing_window", 1)),
         "checkpoint_path": str(checkpoint_path),
     }
@@ -759,7 +1012,118 @@ def _run_eval(config: dict[str, Any], *, split: str) -> tuple[dict[str, Any], Pa
     _write_json(report_path, metrics)
     _write_json(reports / f"{split}_scores.json", summary)
     _write_json(reports / f"{split}_scores_smoothed.json", smoothed)
+    _write_json(
+        reports / f"{split}_clip_scores.json",
+        {
+            "split": split,
+            "predictor_threshold": predictor_threshold,
+            "frozen_threshold": frozen_threshold,
+            "clip_score_reduction": "max",
+            "predictor_clips": predictor_clip["clips"],
+            "frozen_clips": frozen_clip["clips"],
+        },
+    )
     return metrics, report_path
+
+
+def _run_predict(config: dict[str, Any]) -> tuple[dict[str, Any], Path, list[str]]:
+    cfg = _build_cfg(config, action="predict")
+    source = cfg["predict"].get("source")
+    split = None if source else str(cfg["predict"].get("split", "test"))
+    if split not in {None, "val", "test"}:
+        split = "test"
+    device = _resolve_device(cfg["train"]["device"])
+    output_root = _make_output_root(cfg)
+    reports = output_root / "reports"
+    reports.mkdir(parents=True, exist_ok=True)
+    feature_extractor = build_feature_extractor(
+        model_name=cfg["model"]["name"],
+        checkpoint_path=cfg["model"]["checkpoint"],
+        checkpoint_key=cfg["model"]["checkpoint_key"],
+        num_frames=cfg["dataset"]["past_frames"],
+        image_size=cfg["dataset"]["image_size"],
+        device=device,
+    )
+    predictor = build_predictor(cfg["model"], feature_extractor).to(device)
+    checkpoint_path = _resolve_checkpoint_path(cfg, "eval")
+    checkpoint = load_checkpoint(checkpoint_path)
+    predictor.load_state_dict(checkpoint.get("model_state") or checkpoint.get("predictor_state") or checkpoint.get("extras", {}).get("predictor_state"))
+    predictor.eval()
+    if source:
+        videos = [_build_source_record(source, video_backend=str(cfg["dataset"].get("video_backend", "auto")))]
+        loader = _build_eval_loader(
+            videos,
+            cfg,
+            batch_size=int(cfg["predict"]["batch_size"]),
+            num_workers=int(cfg["predict"]["num_workers"]),
+        )
+        desc = f"predict:{Path(source).name}"
+    else:
+        loaders = _make_loaders(cfg, include_test=True)
+        videos = loaders["val_videos"] if split == "val" else loaders["test_videos"]
+        loader = loaders["val_loader"] if split == "val" else loaders["test_loader"]
+        desc = f"predict:{split}"
+    summary = _aggregate_scores(loader, predictor, feature_extractor, device, desc=desc, model_cfg=cfg["model"])
+    smoothed = _build_smoothed_summary(summary, int(cfg["eval"].get("smoothing_window", 1)))
+    report_stem = "source" if source else str(split)
+    _write_json(reports / f"{report_stem}_predict_scores.json", summary)
+    _write_json(reports / f"{report_stem}_predict_scores_smoothed.json", smoothed)
+    threshold = cfg["predict"].get("threshold")
+    metrics: dict[str, Any] = {
+        "split": split,
+        "source": source,
+        "predictor_type": cfg["model"]["predictor_type"],
+        "smoothing_window": int(cfg["eval"].get("smoothing_window", 1)),
+        "checkpoint_path": str(checkpoint_path),
+        "threshold": None if threshold is None else float(threshold),
+    }
+    if not source:
+        labels_raw, scores_pred_raw = _flatten_metric_arrays(summary, "predictor_scores")
+        _, scores_frozen_raw = _flatten_metric_arrays(summary, "frozen_scores")
+        labels, scores_pred = _flatten_metric_arrays(smoothed, "predictor_scores")
+        _, scores_frozen = _flatten_metric_arrays(smoothed, "frozen_scores")
+        metrics.update(
+            {
+                "predictor_frame_auc_raw": _roc_auc_score(labels_raw, scores_pred_raw),
+                "frozen_diff_frame_auc_raw": _roc_auc_score(labels_raw, scores_frozen_raw),
+                "predictor_frame_auc": _roc_auc_score(labels, scores_pred),
+                "frozen_diff_frame_auc": _roc_auc_score(labels, scores_frozen),
+            }
+        )
+    if threshold is not None:
+        threshold_value = float(threshold)
+        predictor_clip = _threshold_clip_predictions(smoothed, "predictor_scores", threshold=threshold_value, reduction="max")
+        metrics.update(
+            {
+                "clip_score_reduction": "max",
+                "predictor_thresholded": predictor_clip,
+            }
+        )
+    report_payload = {"summary": smoothed, "metrics": metrics}
+    report_path = reports / f"{report_stem}_predict_summary.json"
+    _write_json(report_path, report_payload)
+    rendered_outputs: list[str] = []
+    if bool(cfg["predict"].get("visualize", False)):
+        if threshold is None:
+            raise ValueError("predict.visualize=true requires predict.threshold=<float>")
+        output_dir = cfg["predict"].get("output_dir")
+        render_root = (_repo_root() / output_dir).resolve() if output_dir else _predict_output_root(cfg, split=split, source=source)
+        for video in videos:
+            payload = smoothed["videos"].get(video.name)
+            if payload is None:
+                continue
+            render_path = render_root / f"{video.name}.mp4"
+            _render_prediction_video(
+                source_path=video.media_path,
+                output_path=render_path,
+                predictor_scores=payload["predictor_scores"],
+                threshold=float(threshold),
+                labels=payload.get("labels"),
+            )
+            rendered_outputs.append(str(render_path))
+        metrics["rendered_outputs"] = rendered_outputs
+        _write_json(reports / f"{report_stem}_predict_visualization.json", metrics)
+    return metrics, report_path, rendered_outputs
 
 
 def validate_from_runtime_config(config: dict[str, Any]) -> AnomalyValidationResult:
@@ -771,11 +1135,11 @@ def validate_from_runtime_config(config: dict[str, Any]) -> AnomalyValidationRes
 
 
 def predict_from_runtime_config(config: dict[str, Any]) -> AnomalyPredictResult:
-    split = str(config["predict"].get("split", "test"))
+    split = config["predict"].get("split")
+    metrics, report_path, rendered_outputs = _run_predict(config)
     if split not in {"val", "test"}:
-        split = "test"
-    metrics, report_path = _run_eval(config, split=split)
-    return AnomalyPredictResult(split=split, metrics=metrics, report_path=str(report_path))
+        split = None
+    return AnomalyPredictResult(split=split, metrics=metrics, report_path=str(report_path), rendered_outputs=rendered_outputs or None)
 
 
 def export_from_runtime_config(config: dict[str, Any]) -> AnomalyExportResult:

@@ -311,3 +311,40 @@ def get_video_frame_count(
     reader = _get_video_reader(source, reader_cache_size=reader_cache_size)
     counts[key] = int(len(reader))
     return counts[key]
+
+
+def read_video_frames_uint8(
+    path: str | Path,
+    *,
+    clip_start: int = 0,
+    clip_len: int | None = None,
+    stride: int = 1,
+    reader_cache_size: int = _DEFAULT_READER_CACHE_SIZE,
+) -> np.ndarray:
+    source = Path(path)
+    if source.suffix == ".pt":
+        tensor = _read_tensor_video(source)
+        if clip_len is None:
+            sliced = tensor[max(0, clip_start) :: max(1, stride)]
+        else:
+            end = clip_start + clip_len * stride
+            sliced = tensor[max(0, clip_start) : end : max(1, stride)]
+            sliced = _pad_clip_tensor(sliced, int(clip_len))
+        if sliced.numel() == 0:
+            return np.empty((0, 0, 0, 3), dtype=np.uint8)
+        if sliced.max() <= 1.0 and sliced.min() >= 0.0:
+            scaled = (sliced.clamp(0.0, 1.0) * 255.0).round()
+        else:
+            scaled = sliced.clamp(0.0, 255.0)
+        return scaled.byte().permute(0, 2, 3, 1).cpu().numpy()
+    reader = _get_video_reader(source, reader_cache_size=reader_cache_size)
+    total = len(reader)
+    indices = _normalize_indices(total, clip_start=clip_start, clip_len=clip_len, stride=stride)
+    if not indices:
+        return np.empty((0, 0, 0, 3), dtype=np.uint8)
+    frames = reader.get_batch(indices).asnumpy()
+    target_len = int(clip_len or 0)
+    if target_len > 0 and frames.shape[0] < target_len and frames.shape[0] > 0:
+        pad = np.repeat(frames[-1:, :, :, :], target_len - frames.shape[0], axis=0)
+        frames = np.concatenate([frames, pad], axis=0)
+    return frames.astype(np.uint8, copy=False)

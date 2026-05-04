@@ -60,6 +60,9 @@ predict:
   batch_size: 1
   num_workers: 0
   split: test
+  threshold: null
+  visualize: false
+  output_dir: null
 export:
   format: onnx
   output_path: anomaly.onnx
