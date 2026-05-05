@@ -220,6 +220,41 @@ class VJEPAImageBackbone(nn.Module):
             temporal_tokens=1,
         )
 
+    def build_cache_items_batch(self, x: torch.Tensor, *, split_layer: int) -> list[CachedFeatureItem]:
+        """Batched variant of build_cache_item — returns one CachedFeatureItem per batch element."""
+        total_layers = self.get_num_layers()
+        tokens, T, height_patches, width_patches, mode = self._prepare_tokens(x)
+        batch_size = x.shape[0]
+        if split_layer >= total_layers:
+            _, outputs = self._run_blocks(tokens, start_layer=0, end_layer=total_layers, T=T, height_patches=height_patches, width_patches=width_patches, mode=mode)
+            return [
+                CachedFeatureItem(
+                    mode="final",
+                    media="image",
+                    split_layer=total_layers,
+                    token_state=None,
+                    cached_outputs=[feature[b].detach().cpu() for feature in outputs],
+                    height_patches=height_patches,
+                    width_patches=width_patches,
+                    temporal_tokens=1,
+                )
+                for b in range(batch_size)
+            ]
+        prefix_tokens, outputs = self._run_blocks(tokens, start_layer=0, end_layer=split_layer, T=T, height_patches=height_patches, width_patches=width_patches, mode=mode)
+        return [
+            CachedFeatureItem(
+                mode="prefix",
+                media="image",
+                split_layer=split_layer,
+                token_state=prefix_tokens[b].detach().cpu(),
+                cached_outputs=[feature[b].detach().cpu() for feature in outputs],
+                height_patches=height_patches,
+                width_patches=width_patches,
+                temporal_tokens=1,
+            )
+            for b in range(batch_size)
+        ]
+
     def forward_cached(self, batch: CachedFeatureBatch) -> list[torch.Tensor]:
         if batch.mode == "final":
             return list(batch.cached_outputs)
@@ -393,6 +428,41 @@ class VJEPAVideoBackbone(nn.Module):
             width_patches=width_patches,
             temporal_tokens=temporal_tokens,
         )
+
+    def build_cache_items_batch(self, x: torch.Tensor, *, split_layer: int) -> list[CachedFeatureItem]:
+        """Batched variant of build_cache_item — returns one CachedFeatureItem per batch element."""
+        total_layers = self.get_num_layers()
+        tokens, temporal_tokens, height_patches, width_patches, mode = self._prepare_tokens(x)
+        batch_size = x.shape[0]
+        if split_layer >= total_layers:
+            _, outputs = self._run_blocks(tokens, start_layer=0, end_layer=total_layers, temporal_tokens=temporal_tokens, height_patches=height_patches, width_patches=width_patches, mode=mode)
+            return [
+                CachedFeatureItem(
+                    mode="final",
+                    media="video",
+                    split_layer=total_layers,
+                    token_state=None,
+                    cached_outputs=[feature[b].detach().cpu() for feature in outputs],
+                    height_patches=height_patches,
+                    width_patches=width_patches,
+                    temporal_tokens=temporal_tokens,
+                )
+                for b in range(batch_size)
+            ]
+        prefix_tokens, outputs = self._run_blocks(tokens, start_layer=0, end_layer=split_layer, temporal_tokens=temporal_tokens, height_patches=height_patches, width_patches=width_patches, mode=mode)
+        return [
+            CachedFeatureItem(
+                mode="prefix",
+                media="video",
+                split_layer=split_layer,
+                token_state=prefix_tokens[b].detach().cpu(),
+                cached_outputs=[feature[b].detach().cpu() for feature in outputs],
+                height_patches=height_patches,
+                width_patches=width_patches,
+                temporal_tokens=temporal_tokens,
+            )
+            for b in range(batch_size)
+        ]
 
     def forward_cached(self, batch: CachedFeatureBatch) -> list[torch.Tensor]:
         if batch.mode == "final":

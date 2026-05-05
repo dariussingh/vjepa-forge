@@ -1,15 +1,25 @@
 from __future__ import annotations
 
+import functools
+import os
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
+from torch.utils.data import DataLoader
+from torch.utils.data import Dataset as TorchDataset
 
 from vjepa_forge.data.cache import FeatureCacheStore, cached_feature_item_key, default_feature_cache_root, manifest_cache_dir, serialize_spec
 from vjepa_forge.data.forge.dataset import ForgeDataset
 from vjepa_forge.data.image import read_image
 from vjepa_forge.data.video import read_video_clip
+
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - optional dependency
+    tqdm = None
 
 
 @dataclass(frozen=True)
@@ -97,6 +107,9 @@ def resolve_generic_cache_store(
     split: str,
     data_cfg: dict[str, Any],
     freeze_cfg: dict[str, Any] | None,
+    runtime=None,
+    batch_size: int | None = None,
+    num_workers: int | None = None,
 ) -> FeatureCacheStore | None:
     settings = resolve_feature_cache_settings(data_cfg=data_cfg, dataset_root=dataset.root)
     if settings.enabled == "false":
@@ -126,6 +139,9 @@ def resolve_generic_cache_store(
             if settings.enabled == "true":
                 raise FileNotFoundError(f"Feature cache missing for split={split}: {store.cache_dir}")
             return None
+        resolved_batch_size = int(data_cfg.get("feature_cache_batch_size") or batch_size or data_cfg.get("batch_size", 32))
+        resolved_workers = num_workers
+        amp_dtype = runtime.amp_dtype if runtime is not None else None
         build_generic_feature_cache(
             store=store,
             spec=spec,
@@ -138,12 +154,84 @@ def resolve_generic_cache_store(
             image_backend=image_backend,
             video_backend=video_backend,
             shard_size=settings.shard_size,
+            batch_size=resolved_batch_size,
+            num_workers=resolved_workers,
+            amp_dtype=amp_dtype,
         )
     elif settings.validate and not store.spec_matches(spec):
         if settings.enabled == "true":
             raise ValueError(f"Feature cache spec mismatch for split={split}: {store.cache_dir}")
         return None
     return store
+
+
+# ---------------------------------------------------------------------------
+# DataLoader-based batched cache build helpers
+# ---------------------------------------------------------------------------
+
+class _ForgeRecordDataset(TorchDataset):
+    """Thin torch Dataset adapter exposing ForgeDataset records for DataLoader workers."""
+
+    def __init__(self, forge_dataset: ForgeDataset) -> None:
+        self._records = forge_dataset.records
+        self._media = forge_dataset.media
+
+    def __len__(self) -> int:
+        return len(self._records)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        return {"index": index, "media_path": str(self._records[index].media_path)}
+
+
+def _cache_build_collate_fn(
+    batch: list[dict[str, Any]],
+    *,
+    records,
+    media: str,
+    image_size: int,
+    clip_len: int,
+    clip_stride: int,
+    image_backend: str,
+    video_backend: str,
+    reader_cache_size: int,
+) -> dict[str, Any]:
+    """Decode a batch of media items in worker processes; returns stacked tensors and keys."""
+    tensors: list[torch.Tensor] = []
+    keys: list[str] = []
+    for item in batch:
+        record = records[item["index"]]
+        if media == "image":
+            tensor = read_image(record.media_path, image_size=image_size, image_backend=image_backend, reader_cache_size=reader_cache_size)
+            key = cached_feature_item_key(media_path=record.media_path)
+        else:
+            tensor = read_video_clip(
+                record.media_path,
+                clip_len=clip_len,
+                stride=clip_stride,
+                image_size=image_size,
+                reader_cache_size=reader_cache_size,
+                video_backend=video_backend,
+            )
+            key = cached_feature_item_key(media_path=record.media_path, clip_len=clip_len, stride=clip_stride)
+        tensors.append(tensor)
+        keys.append(key)
+    return {"tensors": torch.stack(tensors, dim=0), "keys": keys}
+
+
+def _dali_active(*, video_backend: str, image_backend: str, media: str) -> bool:
+    """Return True if the configured backend resolves to DALI for the given media type."""
+    def _has_dali() -> bool:
+        try:
+            import nvidia.dali  # noqa: F401
+            return True
+        except Exception:
+            return False
+
+    if media == "video":
+        return video_backend == "dali" or (video_backend == "auto" and _has_dali())
+    if media == "image":
+        return image_backend == "dali" or (image_backend == "auto" and _has_dali())
+    return False
 
 
 def build_generic_feature_cache(
@@ -159,25 +247,75 @@ def build_generic_feature_cache(
     image_backend: str,
     video_backend: str,
     shard_size: int,
+    batch_size: int = 32,
+    num_workers: int | None = None,
+    amp_dtype: torch.dtype | None = None,
 ) -> None:
-    items: list[tuple[str, Any]] = []
     model.backbone.eval()
     device = next(model.parameters()).device
-    with torch.no_grad():
-        for record in dataset.records:
-            if dataset.media == "image":
-                tensor = read_image(record.media_path, image_size=image_size, image_backend=image_backend, reader_cache_size=int(spec.get("reader_cache_size", 4)))
-                key = cached_feature_item_key(media_path=record.media_path)
-            else:
-                tensor = read_video_clip(
-                    record.media_path,
-                    clip_len=clip_len,
-                    stride=clip_stride,
-                    image_size=image_size,
-                    reader_cache_size=int(spec.get("reader_cache_size", 4)),
-                    video_backend=video_backend,
-                )
-                key = cached_feature_item_key(media_path=record.media_path, clip_len=clip_len, stride=clip_stride)
-            item = model.backbone.build_cache_item(tensor.unsqueeze(0).to(device), media=dataset.media, split_layer=split_layer)
-            items.append((key, item))
-    store.write(spec=spec, items=items, shard_size=shard_size)
+    reader_cache_size = int(spec.get("reader_cache_size", 4))
+
+    # DALI requires num_workers=0 (pipelines cannot be forked) — mirror trainer policy
+    use_dali = _dali_active(video_backend=video_backend, image_backend=image_backend, media=dataset.media)
+    if use_dali:
+        resolved_workers = 0
+    elif num_workers is not None:
+        resolved_workers = int(num_workers)
+    else:
+        resolved_workers = max(2, min(8, os.cpu_count() or 1))
+
+    if tqdm is not None:
+        tqdm.write(
+            f"building feature cache at {store.cache_dir} "
+            f"(batch_size={batch_size}, workers={resolved_workers}, backend={'dali' if use_dali else video_backend if dataset.media == 'video' else image_backend})"
+        )
+
+    torch_dataset = _ForgeRecordDataset(dataset)
+    collate_fn = functools.partial(
+        _cache_build_collate_fn,
+        records=dataset.records,
+        media=dataset.media,
+        image_size=image_size,
+        clip_len=clip_len,
+        clip_stride=clip_stride,
+        image_backend=image_backend,
+        video_backend=video_backend,
+        reader_cache_size=reader_cache_size,
+    )
+    loader_kwargs: dict[str, Any] = {
+        "batch_size": batch_size,
+        "shuffle": False,
+        "num_workers": resolved_workers,
+        "collate_fn": collate_fn,
+        "pin_memory": (device.type == "cuda" and not use_dali),
+    }
+    if resolved_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 2
+    loader = DataLoader(torch_dataset, **loader_kwargs)
+
+    autocast_ctx = (
+        torch.autocast(device_type="cuda", dtype=amp_dtype)
+        if (amp_dtype is not None and device.type == "cuda")
+        else nullcontext()
+    )
+
+    iterator = loader if tqdm is None else tqdm(
+        loader,
+        desc=f"cache:{dataset.task}:{dataset.split}",
+        total=len(loader),
+        dynamic_ncols=True,
+    )
+
+    with store.open_streaming_write(spec=spec, shard_size=shard_size) as writer:
+        with torch.inference_mode():
+            with autocast_ctx:
+                for batch in iterator:
+                    x = batch["tensors"].to(device, non_blocking=True)
+                    if dataset.media == "video" and x.ndim == 5:
+                        # read_video_clip returns [T, C, H, W]; stacked → [B, T, C, H, W]
+                        # backbone expects [B, C, T, H, W]
+                        x = x.permute(0, 2, 1, 3, 4).contiguous()
+                    items = model.backbone.build_cache_items_batch(x, media=dataset.media, split_layer=split_layer)
+                    for key, item in zip(batch["keys"], items):
+                        writer.append(key, item)

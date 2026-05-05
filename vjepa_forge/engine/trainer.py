@@ -106,7 +106,10 @@ class BaseTrainer:
             model=self.model,
             split=split,
             data_cfg=self.model.data_cfg,
-            freeze_cfg=self._active_freeze_cfg if split == "train" else self._active_freeze_cfg,
+            freeze_cfg=self._active_freeze_cfg,
+            runtime=self.runtime,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
         )
         if dataset.task == "classify":
             collator = ClassifyLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size, reader_cache_size=reader_cache_size, video_backend=video_backend, image_backend=image_backend, feature_cache=feature_cache)

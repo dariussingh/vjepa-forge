@@ -127,6 +127,9 @@ class FeatureCacheStore:
             temporal_tokens=int(payload["temporal_tokens"]),
         )
 
+    def open_streaming_write(self, *, spec: dict[str, Any], shard_size: int = 64) -> "_StreamingCacheWriter":
+        return _StreamingCacheWriter(self, spec=spec, shard_size=shard_size)
+
     def write(self, *, spec: dict[str, Any], items: list[tuple[str, CachedFeatureItem]], shard_size: int = 64) -> None:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         manifest_items: dict[str, dict[str, Any]] = {}
@@ -206,3 +209,72 @@ def recursive_to_device(value: Any, device: torch.device) -> Any:
 
 def serialize_spec(payload: dict[str, Any]) -> dict[str, Any]:
     return json.loads(json.dumps(payload, sort_keys=True))
+
+
+class _StreamingCacheWriter:
+    """Context manager that writes cache shards to disk as they fill up.
+
+    Flushes a shard every `shard_size` items so the caller never needs to hold
+    the full dataset in RAM. The manifest is written only on successful commit,
+    so a crash mid-build leaves no corrupt manifest (partial shard files are
+    simply overwritten on retry).
+    """
+
+    def __init__(self, store: "FeatureCacheStore", *, spec: dict[str, Any], shard_size: int) -> None:
+        self._store = store
+        self._spec = spec
+        self._shard_size = max(1, int(shard_size))
+        self._manifest_items: dict[str, dict[str, Any]] = {}
+        self._shard_payload: list[dict[str, Any]] = []
+        self._shard_index = 0
+        self._item_count = 0
+
+    def append(self, key: str, item: CachedFeatureItem) -> None:
+        self._shard_payload.append(
+            {
+                "mode": item.mode,
+                "media": item.media,
+                "split_layer": item.split_layer,
+                "token_state": item.token_state,
+                "cached_outputs": item.cached_outputs,
+                "height_patches": item.height_patches,
+                "width_patches": item.width_patches,
+                "temporal_tokens": item.temporal_tokens,
+            }
+        )
+        self._manifest_items[key] = {
+            "shard": f"shard_{self._shard_index:05d}.pt",
+            "index": len(self._shard_payload) - 1,
+        }
+        self._item_count += 1
+        if len(self._shard_payload) >= self._shard_size:
+            self._flush_shard()
+
+    def _flush_shard(self) -> None:
+        if not self._shard_payload:
+            return
+        self._store.cache_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(self._shard_payload, self._store.cache_dir / f"shard_{self._shard_index:05d}.pt")
+        self._shard_payload = []
+        self._shard_index += 1
+
+    def commit(self) -> None:
+        self._flush_shard()
+        manifest = {
+            "version": 1,
+            "spec": self._spec,
+            "item_count": self._item_count,
+            "items": self._manifest_items,
+        }
+        self._store.cache_dir.mkdir(parents=True, exist_ok=True)
+        self._store.manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+        self._store._manifest = manifest
+        self._store._loaded_shard_name = None
+        self._store._loaded_shard_items = None
+
+    def __enter__(self) -> "_StreamingCacheWriter":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        if exc_type is None:
+            self.commit()

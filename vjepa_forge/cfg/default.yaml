@@ -24,6 +24,7 @@ data:
   feature_cache_build_on_miss: true
   feature_cache_readonly: false
   feature_cache_shard_size: 64
+  feature_cache_batch_size: null
   past_frames: 8
   future_frames: 8
   stride: 1

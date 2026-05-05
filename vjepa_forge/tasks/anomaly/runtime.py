@@ -350,50 +350,117 @@ def _build_anomaly_feature_cache(
     feature_extractor: nn.Module,
     device: torch.device,
     shard_size: int,
+    batch_size: int | None = None,
+    num_workers: int | None = None,
+    amp_dtype: torch.dtype | None = None,
 ) -> None:
-    lookup = {video.name: video for video in videos}
-    items: list[tuple[str, CachedFeatureItem]] = []
+    """Build the anomaly feature cache using batched DataLoader for GPU efficiency.
+
+    Reuses _WindowBatchSampler + _collate_window_batch so windows from the same
+    video are decoded once (O(B+T) instead of O(B*T)) and the configured video
+    backend (DALI or decord) is respected. Writes shards to disk incrementally
+    via _StreamingCacheWriter to avoid accumulating the full dataset in RAM.
+    """
+    from contextlib import nullcontext
+
+    dataset_cfg = cfg["dataset"]
+    image_size = int(dataset_cfg["image_size"])
+    video_backend = str(dataset_cfg.get("video_backend", "auto"))
+    reader_cache_size = int(cfg["eval"]["reader_cache_size"])
+
+    resolved_batch_size = batch_size if batch_size is not None else int(cfg["train"]["batch_size"])
+
+    # DALI requires num_workers=0 — mirror the trainer's existing policy
+    def _has_dali_local() -> bool:
+        try:
+            import nvidia.dali  # noqa: F401
+            return True
+        except Exception:
+            return False
+
+    dali_active = video_backend == "dali" or (video_backend == "auto" and _has_dali_local())
+    if dali_active:
+        resolved_workers = 0
+    elif num_workers is not None:
+        resolved_workers = int(num_workers)
+    else:
+        resolved_workers = int(cfg["train"].get("num_workers", 0))
+
+    if tqdm is not None:
+        tqdm.write(
+            f"building anomaly feature cache at {store.cache_dir} "
+            f"(batch_size={resolved_batch_size}, workers={resolved_workers}, backend={'dali' if dali_active else video_backend})"
+        )
+
+    ds = ForgeAnomalyWindowDataset(videos, windows, image_size, video_backend=video_backend)
+    ds.reader_cache_size = reader_cache_size
+    collate = partial(
+        _collate_window_batch,
+        image_size=image_size,
+        reader_cache_size=reader_cache_size,
+        video_backend=video_backend,
+    )
+    batch_sampler = _WindowBatchSampler(windows, batch_size=resolved_batch_size, shuffle=False)
+    loader_kwargs: dict[str, Any] = {
+        "batch_sampler": batch_sampler,
+        "collate_fn": collate,
+        "num_workers": resolved_workers,
+        "pin_memory": (device.type == "cuda" and not dali_active),
+    }
+    if resolved_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 2
+    loader = DataLoader(ds, **loader_kwargs)
+
+    autocast_ctx = (
+        torch.autocast(device_type="cuda", dtype=amp_dtype)
+        if (amp_dtype is not None and device.type == "cuda")
+        else nullcontext()
+    )
+
+    iterator = loader if tqdm is None else tqdm(
+        loader,
+        desc=f"cache:anomaly:{spec['split']}",
+        total=len(batch_sampler),
+        dynamic_ncols=True,
+    )
+
+    height_patches = int(feature_extractor.grid_size)
+    width_patches = int(feature_extractor.grid_size)
+    temporal_tokens = int(feature_extractor.grid_depth)
+
     feature_extractor.eval()
-    with torch.no_grad():
-        for window in windows:
-            record = lookup[window.video_name]
-            clip_start = int(window.past_indices[0])
-            clip_len = len(window.past_indices) + len(window.future_indices)
-            clip = read_video_clip(
-                record.media_path,
-                clip_start=clip_start,
-                clip_len=clip_len,
-                stride=1,
-                image_size=int(cfg["dataset"]["image_size"]),
-                reader_cache_size=int(cfg["eval"]["reader_cache_size"]),
-                video_backend=str(cfg["dataset"].get("video_backend", "auto")),
-            )
-            past = clip[: len(window.past_indices)].permute(1, 0, 2, 3).contiguous().unsqueeze(0).to(device)
-            future = clip[len(window.past_indices) :].permute(1, 0, 2, 3).contiguous().unsqueeze(0).to(device)
-            past_feat = feature_extractor(past)
-            future_feat = feature_extractor(future)
-            item = CachedFeatureItem(
-                mode="final",
-                media="video",
-                split_layer=-1,
-                token_state=None,
-                cached_outputs=[
-                    past_feat.pooled[0].detach().cpu(),
-                    past_feat.tokens[0].detach().cpu(),
-                    future_feat.pooled[0].detach().cpu(),
-                    future_feat.tokens[0].detach().cpu(),
-                ],
-                height_patches=int(feature_extractor.grid_size),
-                width_patches=int(feature_extractor.grid_size),
-                temporal_tokens=int(feature_extractor.grid_depth),
-            )
-            items.append(
-                (
-                    cached_feature_item_key(media_path=record.media_path, clip_start=clip_start, clip_len=clip_len, stride=1),
-                    item,
-                )
-            )
-    store.write(spec=spec, items=items, shard_size=shard_size)
+    with store.open_streaming_write(spec=spec, shard_size=shard_size) as writer:
+        with torch.no_grad():
+            with autocast_ctx:
+                for batch in iterator:
+                    past_b = batch["past"].to(device, non_blocking=True)
+                    future_b = batch["future"].to(device, non_blocking=True)
+                    past_feat = feature_extractor(past_b)
+                    future_feat = feature_extractor(future_b)
+                    for b in range(past_b.shape[0]):
+                        key = cached_feature_item_key(
+                            media_path=batch["media_path"][b],
+                            clip_start=int(batch["clip_start"][b]),
+                            clip_len=int(batch["clip_len"][b]),
+                            stride=1,
+                        )
+                        item = CachedFeatureItem(
+                            mode="final",
+                            media="video",
+                            split_layer=-1,
+                            token_state=None,
+                            cached_outputs=[
+                                past_feat.pooled[b].detach().cpu(),
+                                past_feat.tokens[b].detach().cpu(),
+                                future_feat.pooled[b].detach().cpu(),
+                                future_feat.tokens[b].detach().cpu(),
+                            ],
+                            height_patches=height_patches,
+                            width_patches=width_patches,
+                            temporal_tokens=temporal_tokens,
+                        )
+                        writer.append(key, item)
 
 
 def _resolve_anomaly_feature_cache_store(
@@ -405,6 +472,7 @@ def _resolve_anomaly_feature_cache_store(
     feature_extractor: nn.Module | None,
     device: torch.device | None,
     source: str | None = None,
+    runtime=None,
 ) -> FeatureCacheStore | None:
     settings = _feature_cache_settings(cfg)
     if settings["enabled"] == "false":
@@ -429,6 +497,7 @@ def _resolve_anomaly_feature_cache_store(
             feature_extractor=feature_extractor,
             device=device,
             shard_size=int(settings["shard_size"]),
+            amp_dtype=runtime.amp_dtype if runtime is not None else None,
         )
     elif store.load_manifest().get("spec") != spec and settings["enabled"] == "true":
         raise ValueError(f"Anomaly feature cache spec mismatch: {store.cache_dir}")
@@ -541,6 +610,10 @@ def _collate_window_batch(batch: list[dict[str, Any]], *, image_size: int, reade
         "video_name": [sample["video_name"] for sample in batch],
         "future_indices": torch.stack([sample["future_indices"] for sample in batch], dim=0),
         "decode_time": float(time.perf_counter() - decode_start),
+        # extra keys used by the feature cache builder to construct cache item keys
+        "media_path": [sample["media_path"] for sample in batch],
+        "clip_start": torch.tensor([int(sample["clip_start"]) for sample in batch], dtype=torch.long),
+        "clip_len": torch.tensor([int(sample["clip_len"]) for sample in batch], dtype=torch.long),
     }
     if "future_labels" in batch[0]:
         collated["future_labels"] = torch.stack([sample["future_labels"] for sample in batch], dim=0)
@@ -607,7 +680,7 @@ def _loader_kwargs(
     return kwargs
 
 
-def _make_loaders(cfg: dict[str, Any], include_test: bool = True, *, feature_extractor: nn.Module | None = None, device: torch.device | None = None) -> dict[str, Any]:
+def _make_loaders(cfg: dict[str, Any], include_test: bool = True, *, feature_extractor: nn.Module | None = None, device: torch.device | None = None, runtime=None) -> dict[str, Any]:
     dataset_cfg = cfg["dataset"]
     train_videos = _build_video_records(dataset_cfg["dataset_yaml"], split="train")
     val_split = cfg["eval"].get("split", "val")
@@ -639,6 +712,7 @@ def _make_loaders(cfg: dict[str, Any], include_test: bool = True, *, feature_ext
         videos=train_videos,
         feature_extractor=feature_extractor,
         device=device,
+        runtime=runtime,
     )
     val_cache = _resolve_anomaly_feature_cache_store(
         cfg=cfg,
@@ -647,6 +721,7 @@ def _make_loaders(cfg: dict[str, Any], include_test: bool = True, *, feature_ext
         videos=val_videos,
         feature_extractor=feature_extractor,
         device=device,
+        runtime=runtime,
     )
     test_cache = None
     if include_test:
@@ -657,6 +732,7 @@ def _make_loaders(cfg: dict[str, Any], include_test: bool = True, *, feature_ext
             videos=test_videos,
             feature_extractor=feature_extractor,
             device=device,
+            runtime=runtime,
         )
     train_collate = partial(_collate_cached_window_batch, feature_cache=train_cache) if train_cache is not None else partial(
         _collate_window_batch,
@@ -709,9 +785,9 @@ def _make_loaders(cfg: dict[str, Any], include_test: bool = True, *, feature_ext
     return loaders
 
 
-def _make_loaders_compat(cfg: dict[str, Any], include_test: bool = True, *, feature_extractor: nn.Module | None = None, device: torch.device | None = None) -> dict[str, Any]:
+def _make_loaders_compat(cfg: dict[str, Any], include_test: bool = True, *, feature_extractor: nn.Module | None = None, device: torch.device | None = None, runtime=None) -> dict[str, Any]:
     try:
-        return _make_loaders(cfg, include_test=include_test, feature_extractor=feature_extractor, device=device)
+        return _make_loaders(cfg, include_test=include_test, feature_extractor=feature_extractor, device=device, runtime=runtime)
     except TypeError as exc:
         if "unexpected keyword argument" not in str(exc):
             raise
@@ -1235,7 +1311,7 @@ def train_from_runtime_config(config: dict[str, Any]) -> AnomalyTrainResult:
         image_size=cfg["dataset"]["image_size"],
         device=device,
     )
-    loaders = _make_loaders_compat(cfg, include_test=False, feature_extractor=feature_extractor, device=device)
+    loaders = _make_loaders_compat(cfg, include_test=False, feature_extractor=feature_extractor, device=device, runtime=runtime)
     predictor = runtime.prepare_module(build_predictor(cfg["model"], feature_extractor), training=True)
     train_settings = build_train_settings(cfg["train"], epochs=int(cfg["train"]["epochs"]), batch_size=int(cfg["train"]["batch_size"]))
     backbone_ref = getattr(feature_extractor, "encoder", feature_extractor)

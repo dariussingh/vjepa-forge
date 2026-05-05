@@ -61,6 +61,13 @@ class VJEPA21Backbone(nn.Module):
             return self.video_backbone.build_cache_item(self.video_tokenizer(x), split_layer=split_layer)
         raise ValueError(f"Unsupported media for cache item build: {media}")
 
+    def build_cache_items_batch(self, x: torch.Tensor, *, media: str, split_layer: int):
+        if media == "image":
+            return self.image_backbone.build_cache_items_batch(self.image_tokenizer(x), split_layer=split_layer)
+        if media == "video":
+            return self.video_backbone.build_cache_items_batch(self.video_tokenizer(x), split_layer=split_layer)
+        raise ValueError(f"Unsupported media for batched cache build: {media}")
+
     def forward_cached(self, cached: CachedFeatureBatch) -> list[torch.Tensor]:
         if cached.media == "image":
             return self.image_backbone.forward_cached(cached)
