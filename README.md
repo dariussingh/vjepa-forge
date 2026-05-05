@@ -107,7 +107,7 @@ forge anomaly train \
   model.backbone.checkpoint=weights/vjepa2_1_vitb_dist_vitG_384.pt \
   data.image_size=384 \
   train.epochs=10 \
-  train.batch_size=1 \
+  train.batch_size=16 \
   train.num_workers=8 \
   train.device=cuda
 ```
@@ -147,6 +147,8 @@ Anomaly checkpoints and reports are written under `outputs/vjepa-forge/anomaly/c
 For video tasks, decoded clip loading is shared across tasks and can be tuned with `train.num_workers`, `train.prefetch_factor`, `train.persistent_workers`, and `train.reader_cache_size`.
 To force GPU-side decode, set `data.video_backend=dali`. The DALI path uses DALI experimental video decode APIs so anomaly sliding windows and other nonzero-offset clip reads work through the same backend.
 
+> **Device note:** `train.device` is the global device setting for all modes (train, val, predict, export). There is no separate `val.device` — pass `train.device=cuda` in every command that needs GPU.
+
 ## Inference
 
 ```bash
@@ -167,7 +169,7 @@ forge anomaly predict \
 
 ## Export
 
-Anomaly export currently produces ONNX on the active `forge` path:
+Export is currently implemented for the **anomaly task only**. Anomaly export produces ONNX:
 
 ```bash
 forge anomaly export \
@@ -178,6 +180,31 @@ forge anomaly export \
   export.output_path=weights/cafe_anomaly_vitb.onnx
 ```
 
+## Performance
+
+Three levers that significantly reduce training time with no accuracy cost:
+
+| Setting | Effect |
+|---|---|
+| `distributed.precision=bf16` | AMP bf16 mixed-precision — typically 1.5–2× faster on Ampere+ |
+| `distributed.compile=true` | `torch.compile` on the frozen feature extractor — ~20–40% backbone throughput gain |
+| `data.video_backend=dali` | GPU-side video decode — eliminates CPU decode bottleneck for large video datasets |
+| `data.feature_cache=true` | Pre-extract and disk-cache backbone features — eliminates backbone forward pass from the training loop entirely |
+
+For anomaly training on large video datasets, combining `feature_cache=true` with `feature_cache_dtype=fp16` reduces both disk usage and cache-build time by ~50% vs fp32.
+
+## Config Reference
+
+Key config sections and their supported keys (for `load_runtime_config` / `forge anomaly train` style commands):
+
+**`train.*`**: `epochs`, `batch_size`, `lr`, `lr_mode`, `lr_scale_rule`, `reference_batch_size`, `reference_lr`, `weight_decay`, `device`, `num_workers`, `prefetch_factor`, `persistent_workers`, `pin_memory`, `reader_cache_size`, `seed`, `resume`, `project`, `name`, `exist_ok`, `save`, `save_period`, `scheduler`, `early_stopping`
+
+**`data.*`**: `image_size`, `image_backend`, `video_backend`, `feature_cache`, `feature_cache_root`, `feature_cache_build_on_miss`, `feature_cache_readonly`, `feature_cache_shard_size`, `feature_cache_dtype`, `train_fraction`, `past_frames`, `future_frames`, `stride`, `augment`
+
+**`val.*`**: `batch_size`, `num_workers`, `split`, `checkpoint_target`, `checkpoint_path`, `threshold_std_multiplier`, `smoothing_window`
+
+**`distributed.*`**: `precision` (`fp32`/`bf16`/`fp16`), `compile`, `compile_mode`, `backend`, `strategy`, `sync_batchnorm`, `tf32`, `channels_last`
+
 ## Dataset Conversion
 
 External dataset formats should be converted into the canonical Forge layout before training.
@@ -185,12 +212,11 @@ External dataset formats should be converted into the canonical Forge layout bef
 Examples:
 
 ```bash
-forge convert coco source=/data/coco out=/data/coco_forge task=detect media=image
-forge convert kinetics source=/data/kinetics out=/data/kinetics_forge task=classify media=video
-forge convert davis source=/data/DAVIS out=/data/davis_forge task=segment media=video
-forge convert ucsd source=/data/UCSDped2 out=/data/ucsd_forge task=anomaly media=video
+# Only the cafe converter is currently implemented:
 forge convert cafe source=data/cafe out=data/cafe_forge task=anomaly media=video
 ```
+
+> **Note:** Converters for COCO, Kinetics, DAVIS, and UCSD are not yet implemented. Use the Forge dataset layout directly for those formats.
 
 ## Forge Datasets
 

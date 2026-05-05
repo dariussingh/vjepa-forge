@@ -6,6 +6,8 @@ from typing import Any
 
 import yaml
 
+from vjepa_forge.cfg.schema import validate_config
+
 
 CFG_ROOT = Path(__file__).resolve().parent
 RECIPE_ROOT = CFG_ROOT / "recipes"
@@ -113,6 +115,7 @@ def load_runtime_config(
         config["data"]["config"] = str(data)
     if overrides:
         config = apply_overrides(config, overrides)
+    validate_config(config)
     return config
 
 

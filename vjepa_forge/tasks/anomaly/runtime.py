@@ -1,11 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from functools import partial
-import json
 import math
 import os
-import random
 import time
 from pathlib import Path
 from typing import Any
@@ -14,16 +10,38 @@ import cv2
 import numpy as np
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 
-from vjepa_forge.data.cache import CachedFeatureItem, FeatureCacheStore, cached_feature_item_key, default_feature_cache_root, manifest_cache_dir
-from vjepa_forge.data.forge.dataset import ForgeDataset
-from vjepa_forge.data.video import get_video_frame_count, read_video_clip, read_video_clips, read_video_frames_uint8
-from vjepa_forge.engine.checkpointing import checkpoint_paths, checkpoint_payload, load_checkpoint, resolve_resume_path, resolve_run_dir, results_csv_rows, save_checkpoint, write_results_csv
+from vjepa_forge.data.video import read_video_frames_uint8
+from vjepa_forge.engine.checkpointing import checkpoint_paths, checkpoint_payload, load_checkpoint, resolve_resume_path, results_csv_rows, save_checkpoint, write_results_csv
 from vjepa_forge.engine.optimization import build_scheduler, build_train_settings, normalize_stages, resolve_autoscaled_lr
 from vjepa_forge.engine.runtime import setup_runtime
 from vjepa_forge.heads.anomaly.modeling import ExtractedFeatures, build_feature_extractor, build_predictor
 from vjepa_forge.losses.anomaly import anomaly_future_prediction_loss
+from vjepa_forge.metrics.anomaly import roc_auc_score as _roc_auc_score
+from vjepa_forge.tasks.anomaly.data import (
+    AnomalyExportResult,
+    AnomalyPredictResult,
+    AnomalyTrainResult,
+    AnomalyValidationResult,
+    _build_source_record,
+    _make_output_root,
+    _predict_output_root,
+    _repo_root,
+    _seed_everything,
+)
+from vjepa_forge.tasks.anomaly.loaders import _build_eval_loader, _make_loaders
+from vjepa_forge.tasks.anomaly.scoring import (
+    _build_smoothed_summary,
+    _clip_level_metrics,
+    _finalize_video_summary,
+    _flatten_metric_arrays,
+    _threshold_clip_predictions,
+    _thresholds_from_smoothed_summary,
+    _timing_metrics,
+    _write_csv,
+    _write_json,
+)
 
 try:
     from tqdm.auto import tqdm
@@ -31,173 +49,19 @@ except Exception:  # pragma: no cover
     tqdm = None
 
 
-@dataclass(frozen=True)
-class VideoClipRecord:
-    name: str
-    media_path: str
-    frame_count: int
-    frame_labels: tuple[int, ...] | None
-
-
-@dataclass(frozen=True)
-class WindowRecord:
-    video_name: str
-    past_indices: tuple[int, ...]
-    future_indices: tuple[int, ...]
-    future_labels: tuple[int, ...] | None
-
-
-@dataclass
-class AnomalyTrainResult:
-    best_val_loss: float
-    best_checkpoint: str
-    last_checkpoint: str
-    run_dir: str
-
-
-@dataclass
-class AnomalyValidationResult:
-    split: str
-    metrics: dict[str, Any]
-    report_path: str
-
-
-@dataclass
-class AnomalyPredictResult:
-    split: str | None
-    metrics: dict[str, Any]
-    report_path: str
-    rendered_outputs: list[str] | None = None
-
-
-@dataclass
-class AnomalyExportResult:
-    output_path: str
-    checkpoint_path: str
-
-
-class ForgeAnomalyWindowDataset(Dataset):
-    def __init__(self, videos: list[VideoClipRecord], windows: list[WindowRecord], image_size: int, video_backend: str = "auto") -> None:
-        self.video_lookup = {video.name: video for video in videos}
-        self.windows = windows
-        self.image_size = image_size
-        self.reader_cache_size = 4
-        self.video_backend = video_backend
-
-    def __len__(self) -> int:
-        return len(self.windows)
-
-    def __getitem__(self, index: int) -> dict[str, Any]:
-        window = self.windows[index]
-        record = self.video_lookup[window.video_name]
-        sample: dict[str, Any] = {
-            "video_name": record.name,
-            "media_path": record.media_path,
-            "clip_start": int(window.past_indices[0]),
-            "clip_len": len(window.past_indices) + len(window.future_indices),
-            "past_len": len(window.past_indices),
-            "future_indices": torch.tensor(window.future_indices, dtype=torch.long),
-        }
-        if window.future_labels is not None:
-            sample["future_labels"] = torch.tensor(window.future_labels, dtype=torch.long)
-        return sample
-
-
-class _WindowBatchSampler:
-    def __init__(self, windows: list[WindowRecord], *, batch_size: int, shuffle: bool) -> None:
-        self.batch_size = max(1, int(batch_size))
-        self.shuffle = bool(shuffle)
-        grouped: dict[str, list[int]] = {}
-        for idx, window in enumerate(windows):
-            grouped.setdefault(window.video_name, []).append(idx)
-        self.groups = list(grouped.values())
-
-    def __iter__(self):
-        groups = [list(group) for group in self.groups]
-        if self.shuffle:
-            random.shuffle(groups)
-            for group in groups:
-                if len(group) > self.batch_size:
-                    chunks = [group[i : i + self.batch_size] for i in range(0, len(group), self.batch_size)]
-                    random.shuffle(chunks)
-                    group[:] = [idx for chunk in chunks for idx in chunk]
-        batches: list[list[int]] = []
-        for group in groups:
-            for start in range(0, len(group), self.batch_size):
-                batches.append(group[start : start + self.batch_size])
-        if self.shuffle:
-            random.shuffle(batches)
-        return iter(batches)
-
-    def __len__(self) -> int:
-        return sum((len(group) + self.batch_size - 1) // self.batch_size for group in self.groups)
-
-
-class _InferenceWrapper(nn.Module):
-    def __init__(self, feature_extractor: nn.Module, predictor: nn.Module, model_cfg: dict[str, Any]) -> None:
-        super().__init__()
-        self.feature_extractor = feature_extractor
-        self.predictor = predictor
-        self.model_cfg = model_cfg
-        self.tubelet_size = feature_extractor.tubelet_size
-
-    def forward(self, past: torch.Tensor, future: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        past_feat = self.feature_extractor(past)
-        future_feat = self.feature_extractor(future)
-        return _predict_sample_scores(
-            self.predictor,
-            past_feat,
-            future_feat,
-            self.model_cfg,
-            tubelet_size=self.tubelet_size,
-        )
-
-
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[3]
+def _make_loaders_compat(cfg: dict[str, Any], include_test: bool = True, *, feature_extractor=None, device=None, runtime=None) -> dict[str, Any]:
+    try:
+        return _make_loaders(cfg, include_test=include_test, feature_extractor=feature_extractor, device=device, runtime=runtime)
+    except TypeError as exc:
+        if "unexpected keyword argument" not in str(exc):
+            raise
+        return _make_loaders(cfg, include_test=include_test)
 
 
 def _progress(iterable: Any, *, desc: str, total: int | None = None) -> Any:
     if tqdm is None:
         return iterable
     return tqdm(iterable, desc=desc, total=total, dynamic_ncols=True)
-
-
-def _seed_everything(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def _make_output_root(cfg: dict[str, Any]) -> Path:
-    source = cfg.get("predict", {}).get("source") if cfg.get("action") == "predict" else None
-    return resolve_run_dir(
-        task="anomaly",
-        data=source or cfg["dataset"]["dataset_yaml"],
-        project=cfg["train"].get("project") or cfg.get("output", {}).get("root"),
-        name=cfg["train"].get("name"),
-        exist_ok=bool(cfg["train"].get("exist_ok", False) or cfg.get("action") != "train"),
-        resume=cfg["train"].get("resume", False) if cfg.get("action") == "train" else True,
-    )
-
-
-def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-
-def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if not rows:
-        path.write_text("", encoding="utf-8")
-        return
-    headers = list(rows[0].keys())
-    lines = [",".join(headers)]
-    for row in rows:
-        lines.append(",".join(str(row[key]) for key in headers))
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _build_cfg(config: dict[str, Any], *, action: str) -> dict[str, Any]:
@@ -305,576 +169,6 @@ def _build_cfg(config: dict[str, Any], *, action: str) -> dict[str, Any]:
     }
 
 
-def _feature_cache_settings(cfg: dict[str, Any]) -> dict[str, Any]:
-    enabled = str(cfg["dataset"].get("feature_cache", "false")).lower()
-    dataset_yaml = cfg["dataset"].get("dataset_yaml")
-    source = cfg.get("predict", {}).get("source")
-    default_root_base = Path(source).expanduser().resolve().parent if source else (Path(dataset_yaml).expanduser().resolve().parent if dataset_yaml else _repo_root())
-    return {
-        "enabled": enabled,
-        "root": (
-            default_feature_cache_root(default_root_base)
-            if not cfg["dataset"].get("feature_cache_root")
-            else Path(str(cfg["dataset"]["feature_cache_root"])).expanduser().resolve()
-        ),
-        "build_on_miss": bool(cfg["dataset"].get("feature_cache_build_on_miss", True)),
-        "readonly": bool(cfg["dataset"].get("feature_cache_readonly", False)),
-        "shard_size": max(1, int(cfg["dataset"].get("feature_cache_shard_size", 64))),
-        "dtype": str(cfg["dataset"].get("feature_cache_dtype", "fp16")),
-    }
-
-
-def _resolve_cache_dtype(dtype_str: str) -> torch.dtype | None:
-    lowered = str(dtype_str).lower()
-    if lowered == "fp16":
-        return torch.float16
-    if lowered in {"bf16", "bfloat16"}:
-        return torch.bfloat16
-    return None  # fp32 / keep as-is
-
-
-def _anomaly_cache_spec(cfg: dict[str, Any], *, split: str, source: str | None = None) -> dict[str, Any]:
-    return {
-        "task": "anomaly",
-        "media": "video",
-        "split": split,
-        "source": None if source is None else str(Path(source).expanduser().resolve()),
-        "dataset_yaml": cfg["dataset"].get("dataset_yaml"),
-        "image_size": int(cfg["dataset"]["image_size"]),
-        "past_frames": int(cfg["dataset"]["past_frames"]),
-        "future_frames": int(cfg["dataset"]["future_frames"]),
-        "stride": int(cfg["dataset"]["stride"]),
-        "video_backend": str(cfg["dataset"].get("video_backend", "auto")),
-        "model_name": str(cfg["model"]["name"]),
-        "checkpoint": str(cfg["model"]["checkpoint"]),
-        "checkpoint_key": str(cfg["model"]["checkpoint_key"]),
-        "predictor_type": str(cfg["model"]["predictor_type"]),
-        # fraction and seed are part of the spec so different fractions get different cache dirs
-        "train_fraction": float(cfg["dataset"].get("train_fraction", 1.0)) if split == "train" else 1.0,
-        "train_seed": int(cfg["train"].get("seed", 0)),
-    }
-
-
-def _subsample_videos(videos: list[VideoClipRecord], fraction: float, seed: int) -> list[VideoClipRecord]:
-    """Deterministically sample `fraction` of videos using the given seed."""
-    if fraction >= 1.0 or not videos:
-        return videos
-    k = max(1, int(round(len(videos) * fraction)))
-    return random.Random(seed).sample(videos, k)
-
-
-def _build_anomaly_feature_cache(
-    *,
-    store: FeatureCacheStore,
-    spec: dict[str, Any],
-    windows: list[WindowRecord],
-    videos: list[VideoClipRecord],
-    cfg: dict[str, Any],
-    feature_extractor: nn.Module,
-    device: torch.device,
-    shard_size: int,
-    batch_size: int | None = None,
-    num_workers: int | None = None,
-    amp_dtype: torch.dtype | None = None,
-    cache_dtype: torch.dtype | None = torch.float16,
-) -> None:
-    """Build the anomaly feature cache using batched DataLoader for GPU efficiency.
-
-    Reuses _WindowBatchSampler + _collate_window_batch so windows from the same
-    video are decoded once (O(B+T) instead of O(B*T)) and the configured video
-    backend (DALI or decord) is respected. Writes shards to disk incrementally
-    via _StreamingCacheWriter to avoid accumulating the full dataset in RAM.
-    """
-    from contextlib import nullcontext
-
-    dataset_cfg = cfg["dataset"]
-    image_size = int(dataset_cfg["image_size"])
-    video_backend = str(dataset_cfg.get("video_backend", "auto"))
-    reader_cache_size = int(cfg["eval"]["reader_cache_size"])
-
-    resolved_batch_size = batch_size if batch_size is not None else int(cfg["train"]["batch_size"])
-
-    # DALI requires num_workers=0 — mirror the trainer's existing policy
-    def _has_dali_local() -> bool:
-        try:
-            import nvidia.dali  # noqa: F401
-            return True
-        except Exception:
-            return False
-
-    dali_active = video_backend == "dali" or (video_backend == "auto" and _has_dali_local())
-    if dali_active:
-        resolved_workers = 0
-    elif num_workers is not None:
-        resolved_workers = int(num_workers)
-    else:
-        resolved_workers = int(cfg["train"].get("num_workers", 0))
-
-    if tqdm is not None:
-        tqdm.write(
-            f"building anomaly feature cache at {store.cache_dir} "
-            f"(batch_size={resolved_batch_size}, workers={resolved_workers}, backend={'dali' if dali_active else video_backend})"
-        )
-
-    ds = ForgeAnomalyWindowDataset(videos, windows, image_size, video_backend=video_backend)
-    ds.reader_cache_size = reader_cache_size
-    collate = partial(
-        _collate_window_batch,
-        image_size=image_size,
-        reader_cache_size=reader_cache_size,
-        video_backend=video_backend,
-    )
-    batch_sampler = _WindowBatchSampler(windows, batch_size=resolved_batch_size, shuffle=False)
-    loader_kwargs: dict[str, Any] = {
-        "batch_sampler": batch_sampler,
-        "collate_fn": collate,
-        "num_workers": resolved_workers,
-        "pin_memory": (device.type == "cuda" and not dali_active),
-    }
-    if resolved_workers > 0:
-        loader_kwargs["persistent_workers"] = True
-        loader_kwargs["prefetch_factor"] = 2
-    loader = DataLoader(ds, **loader_kwargs)
-
-    autocast_ctx = (
-        torch.autocast(device_type="cuda", dtype=amp_dtype)
-        if (amp_dtype is not None and device.type == "cuda")
-        else nullcontext()
-    )
-
-    iterator = loader if tqdm is None else tqdm(
-        loader,
-        desc=f"cache:anomaly:{spec['split']}",
-        total=len(batch_sampler),
-        dynamic_ncols=True,
-    )
-
-    height_patches = int(feature_extractor.grid_size)
-    width_patches = int(feature_extractor.grid_size)
-    temporal_tokens = int(feature_extractor.grid_depth)
-
-    feature_extractor.eval()
-    with store.open_streaming_write(spec=spec, shard_size=shard_size) as writer:
-        with torch.no_grad():
-            with autocast_ctx:
-                for batch in iterator:
-                    past_b = batch["past"].to(device, non_blocking=True)
-                    future_b = batch["future"].to(device, non_blocking=True)
-                    past_feat = feature_extractor(past_b)
-                    future_feat = feature_extractor(future_b)
-                    for b in range(past_b.shape[0]):
-                        key = cached_feature_item_key(
-                            media_path=batch["media_path"][b],
-                            clip_start=int(batch["clip_start"][b]),
-                            clip_len=int(batch["clip_len"][b]),
-                            stride=1,
-                        )
-                        def _to_cache(t: torch.Tensor) -> torch.Tensor:
-                            out = t.detach()
-                            if cache_dtype is not None:
-                                out = out.to(dtype=cache_dtype)
-                            return out.cpu()
-
-                        item = CachedFeatureItem(
-                            mode="final",
-                            media="video",
-                            split_layer=-1,
-                            token_state=None,
-                            cached_outputs=[
-                                _to_cache(past_feat.pooled[b]),
-                                _to_cache(past_feat.tokens[b]),
-                                _to_cache(future_feat.pooled[b]),
-                                _to_cache(future_feat.tokens[b]),
-                            ],
-                            height_patches=height_patches,
-                            width_patches=width_patches,
-                            temporal_tokens=temporal_tokens,
-                        )
-                        writer.append(key, item)
-
-
-def _resolve_anomaly_feature_cache_store(
-    *,
-    cfg: dict[str, Any],
-    split: str,
-    windows: list[WindowRecord],
-    videos: list[VideoClipRecord],
-    feature_extractor: nn.Module | None,
-    device: torch.device | None,
-    source: str | None = None,
-    runtime=None,
-) -> FeatureCacheStore | None:
-    settings = _feature_cache_settings(cfg)
-    if settings["enabled"] == "false":
-        return None
-    spec = _anomaly_cache_spec(cfg, split=split, source=source)
-    store = FeatureCacheStore(manifest_cache_dir(settings["root"], spec))
-    if not store.exists():
-        if settings["readonly"] or not settings["build_on_miss"]:
-            if settings["enabled"] == "true":
-                raise FileNotFoundError(f"Anomaly feature cache missing: {store.cache_dir}")
-            return None
-        if feature_extractor is None or device is None:
-            if settings["enabled"] == "true":
-                raise RuntimeError("Cannot build anomaly feature cache without a feature extractor")
-            return None
-        _build_anomaly_feature_cache(
-            store=store,
-            spec=spec,
-            windows=windows,
-            videos=videos,
-            cfg=cfg,
-            feature_extractor=feature_extractor,
-            device=device,
-            shard_size=int(settings["shard_size"]),
-            amp_dtype=runtime.amp_dtype if runtime is not None else None,
-            cache_dtype=_resolve_cache_dtype(settings["dtype"]),
-        )
-    elif store.load_manifest().get("spec") != spec and settings["enabled"] == "true":
-        raise ValueError(f"Anomaly feature cache spec mismatch: {store.cache_dir}")
-    return store
-
-
-def _build_video_records(dataset_yaml: str | Path, split: str) -> list[VideoClipRecord]:
-    dataset = ForgeDataset(dataset_yaml, split=split)
-    records: list[VideoClipRecord] = []
-    for record in dataset.records:
-        labels = [0] * get_video_frame_count(
-            record.media_path,
-            reader_cache_size=4,
-            video_backend="decord",
-        )
-        for annotation in record.annotations:
-            if annotation.op != "ano":
-                continue
-            payload = annotation.payload
-            if payload.get("status") != "abnormal":
-                continue
-            start = max(0, int(payload.get("start_frame", 0)))
-            end = min(len(labels) - 1, int(payload.get("end_frame", -1)))
-            for idx in range(start, end + 1):
-                labels[idx] = 1
-        records.append(
-            VideoClipRecord(
-                name=Path(record.media_path).stem,
-                media_path=record.media_path,
-                frame_count=len(labels),
-                frame_labels=tuple(labels),
-            )
-        )
-    return records
-
-
-def _build_source_record(source: str | Path, *, video_backend: str) -> VideoClipRecord:
-    source_path = Path(source)
-    frame_count = get_video_frame_count(source_path, reader_cache_size=4, video_backend=video_backend)
-    return VideoClipRecord(
-        name=source_path.stem,
-        media_path=str(source_path),
-        frame_count=frame_count,
-        frame_labels=None,
-    )
-
-
-def _build_window_records(videos: list[VideoClipRecord], past_frames: int, future_frames: int, stride: int) -> list[WindowRecord]:
-    if past_frames != future_frames:
-        raise ValueError("Active anomaly runtime requires past_frames == future_frames")
-    total = past_frames + future_frames
-    windows: list[WindowRecord] = []
-    for record in videos:
-        if record.frame_count < total:
-            continue
-        for start in range(0, record.frame_count - total + 1, stride):
-            past = tuple(range(start, start + past_frames))
-            future = tuple(range(start + past_frames, start + total))
-            future_labels = None if record.frame_labels is None else tuple(record.frame_labels[idx] for idx in future)
-            windows.append(
-                WindowRecord(
-                    video_name=record.name,
-                    past_indices=past,
-                    future_indices=future,
-                    future_labels=future_labels,
-                )
-            )
-    if not windows:
-        raise RuntimeError("No anomaly windows could be built from the Forge dataset")
-    return windows
-
-
-def _collate_window_batch(batch: list[dict[str, Any]], *, image_size: int, reader_cache_size: int, video_backend: str) -> dict[str, Any]:
-    if not batch:
-        return {}
-    decode_start = time.perf_counter()
-
-    # Group by video path so each video is decoded once.
-    # _WindowBatchSampler already co-locates windows from the same video,
-    # so typically all batch items share one path and only the minimal
-    # contiguous frame range needs to be read (O(B+T) instead of O(B*T)).
-    groups: dict[str, list[int]] = {}
-    for idx, sample in enumerate(batch):
-        groups.setdefault(sample["media_path"], []).append(idx)
-
-    decoded_clips: list[torch.Tensor] = [torch.empty(0)] * len(batch)
-    for path, indices in groups.items():
-        min_start = min(int(batch[i]["clip_start"]) for i in indices)
-        max_end = max(int(batch[i]["clip_start"]) + int(batch[i]["clip_len"]) for i in indices)
-        full = read_video_clip(
-            path,
-            clip_start=min_start,
-            clip_len=max_end - min_start,
-            stride=1,
-            image_size=image_size,
-            reader_cache_size=reader_cache_size,
-            video_backend=video_backend,
-        )
-        for i in indices:
-            s = int(batch[i]["clip_start"]) - min_start
-            decoded_clips[i] = full[s : s + int(batch[i]["clip_len"])]
-
-    past_lens = [int(sample["past_len"]) for sample in batch]
-    future_len = max(0, int(batch[0]["clip_len"]) - past_lens[0])
-    past = torch.stack([decoded_clips[i][:pl].permute(1, 0, 2, 3).contiguous() for i, pl in enumerate(past_lens)], dim=0)
-    future = torch.stack([decoded_clips[i][pl : pl + future_len].permute(1, 0, 2, 3).contiguous() for i, pl in enumerate(past_lens)], dim=0)
-    collated: dict[str, Any] = {
-        "past": past,
-        "future": future,
-        "video_name": [sample["video_name"] for sample in batch],
-        "future_indices": torch.stack([sample["future_indices"] for sample in batch], dim=0),
-        "decode_time": float(time.perf_counter() - decode_start),
-        # extra keys used by the feature cache builder to construct cache item keys
-        "media_path": [sample["media_path"] for sample in batch],
-        "clip_start": torch.tensor([int(sample["clip_start"]) for sample in batch], dtype=torch.long),
-        "clip_len": torch.tensor([int(sample["clip_len"]) for sample in batch], dtype=torch.long),
-    }
-    if "future_labels" in batch[0]:
-        collated["future_labels"] = torch.stack([sample["future_labels"] for sample in batch], dim=0)
-    return collated
-
-
-def _collate_cached_window_batch(batch: list[dict[str, Any]], *, feature_cache: FeatureCacheStore) -> dict[str, Any]:
-    if not batch:
-        return {}
-    past_pooled: list[torch.Tensor] = []
-    past_tokens: list[torch.Tensor] = []
-    future_pooled: list[torch.Tensor] = []
-    future_tokens: list[torch.Tensor] = []
-    for sample in batch:
-        item = feature_cache.get(
-            cached_feature_item_key(
-                media_path=sample["media_path"],
-                clip_start=int(sample["clip_start"]),
-                clip_len=int(sample["clip_len"]),
-                stride=1,
-            )
-        )
-        past_pooled.append(item.cached_outputs[0])
-        past_tokens.append(item.cached_outputs[1])
-        future_pooled.append(item.cached_outputs[2])
-        future_tokens.append(item.cached_outputs[3])
-    collated: dict[str, Any] = {
-        "past_pooled": torch.stack(past_pooled, dim=0),
-        "past_tokens": torch.stack(past_tokens, dim=0),
-        "future_pooled": torch.stack(future_pooled, dim=0),
-        "future_tokens": torch.stack(future_tokens, dim=0),
-        "video_name": [sample["video_name"] for sample in batch],
-        "future_indices": torch.stack([sample["future_indices"] for sample in batch], dim=0),
-        "decode_time": 0.0,
-    }
-    if "future_labels" in batch[0]:
-        collated["future_labels"] = torch.stack([sample["future_labels"] for sample in batch], dim=0)
-    return collated
-
-
-def _loader_kwargs(
-    *,
-    batch_size: int,
-    num_workers: int,
-    pin_memory: bool,
-    persistent_workers: bool,
-    prefetch_factor: int,
-    collate_fn,
-    batch_sampler=None,
-) -> dict[str, Any]:
-    kwargs: dict[str, Any] = {
-        "num_workers": int(num_workers),
-        "collate_fn": collate_fn,
-        "pin_memory": bool(pin_memory),
-    }
-    if batch_sampler is not None:
-        kwargs["batch_sampler"] = batch_sampler
-    else:
-        kwargs["batch_size"] = int(batch_size)
-        kwargs["shuffle"] = False
-    if int(num_workers) > 0:
-        kwargs["persistent_workers"] = bool(persistent_workers)
-        kwargs["prefetch_factor"] = int(prefetch_factor)
-    return kwargs
-
-
-def _make_loaders(cfg: dict[str, Any], include_test: bool = True, *, feature_extractor: nn.Module | None = None, device: torch.device | None = None, runtime=None) -> dict[str, Any]:
-    dataset_cfg = cfg["dataset"]
-    train_videos = _build_video_records(dataset_cfg["dataset_yaml"], split="train")
-    train_fraction = float(dataset_cfg.get("train_fraction", 1.0))
-    train_seed = int(cfg["train"].get("seed", 0))
-    train_videos = _subsample_videos(train_videos, train_fraction, train_seed)
-    val_split = cfg["eval"].get("split", "val")
-    val_videos = _build_video_records(dataset_cfg["dataset_yaml"], split=val_split)
-    test_videos = _build_video_records(dataset_cfg["dataset_yaml"], split="test") if include_test else []
-    common = {
-        "past_frames": dataset_cfg["past_frames"],
-        "future_frames": dataset_cfg["future_frames"],
-        "stride": dataset_cfg["stride"],
-    }
-    train_windows = _build_window_records(train_videos, **common)
-    val_windows = _build_window_records(val_videos, **common)
-    test_windows = _build_window_records(test_videos, **common) if include_test else []
-    image_size = dataset_cfg["image_size"]
-    video_backend = str(dataset_cfg.get("video_backend", "auto"))
-    train_ds = ForgeAnomalyWindowDataset(train_videos, train_windows, image_size, video_backend=video_backend)
-    val_ds = ForgeAnomalyWindowDataset(val_videos, val_windows, image_size, video_backend=video_backend)
-    test_ds = ForgeAnomalyWindowDataset(test_videos, test_windows, image_size, video_backend=video_backend) if include_test else None
-    train_ds.reader_cache_size = int(cfg["train"]["reader_cache_size"])
-    val_ds.reader_cache_size = int(cfg["eval"]["reader_cache_size"])
-    if test_ds is not None:
-        test_ds.reader_cache_size = int(cfg["eval"]["reader_cache_size"])
-    train_num_workers = int(cfg["train"]["num_workers"])
-    eval_num_workers = int(cfg["eval"]["num_workers"])
-    train_cache = _resolve_anomaly_feature_cache_store(
-        cfg=cfg,
-        split="train",
-        windows=train_windows,
-        videos=train_videos,
-        feature_extractor=feature_extractor,
-        device=device,
-        runtime=runtime,
-    )
-    val_cache = _resolve_anomaly_feature_cache_store(
-        cfg=cfg,
-        split=val_split,
-        windows=val_windows,
-        videos=val_videos,
-        feature_extractor=feature_extractor,
-        device=device,
-        runtime=runtime,
-    )
-    test_cache = None
-    if include_test:
-        test_cache = _resolve_anomaly_feature_cache_store(
-            cfg=cfg,
-            split="test",
-            windows=test_windows,
-            videos=test_videos,
-            feature_extractor=feature_extractor,
-            device=device,
-            runtime=runtime,
-        )
-    train_collate = partial(_collate_cached_window_batch, feature_cache=train_cache) if train_cache is not None else partial(
-        _collate_window_batch,
-        image_size=image_size,
-        reader_cache_size=int(cfg["train"]["reader_cache_size"]),
-        video_backend=video_backend,
-    )
-    eval_collate = partial(_collate_cached_window_batch, feature_cache=val_cache) if val_cache is not None else partial(
-        _collate_window_batch,
-        image_size=image_size,
-        reader_cache_size=int(cfg["eval"]["reader_cache_size"]),
-        video_backend=video_backend,
-    )
-    train_loader_kwargs = _loader_kwargs(
-        batch_size=int(cfg["train"]["batch_size"]),
-        num_workers=train_num_workers,
-        pin_memory=bool(cfg["train"]["pin_memory"] and video_backend != "dali"),
-        persistent_workers=bool(cfg["train"]["persistent_workers"]),
-        prefetch_factor=int(cfg["train"]["prefetch_factor"]),
-        collate_fn=train_collate,
-        batch_sampler=_WindowBatchSampler(train_windows, batch_size=int(cfg["train"]["batch_size"]), shuffle=True),
-    )
-    eval_loader_kwargs = _loader_kwargs(
-        batch_size=int(cfg["eval"]["batch_size"]),
-        num_workers=eval_num_workers,
-        pin_memory=bool(cfg["eval"]["pin_memory"] and video_backend != "dali"),
-        persistent_workers=bool(cfg["eval"]["persistent_workers"]),
-        prefetch_factor=int(cfg["eval"]["prefetch_factor"]),
-        collate_fn=eval_collate,
-        batch_sampler=_WindowBatchSampler(val_windows, batch_size=int(cfg["eval"]["batch_size"]), shuffle=False),
-    )
-    loaders: dict[str, Any] = {
-        "train_videos": train_videos,
-        "val_videos": val_videos,
-        "test_videos": test_videos,
-        "train_loader": DataLoader(train_ds, **train_loader_kwargs),
-        "val_loader": DataLoader(val_ds, **eval_loader_kwargs),
-    }
-    if test_ds is not None:
-        test_loader_kwargs = _loader_kwargs(
-            batch_size=int(cfg["eval"]["batch_size"]),
-            num_workers=eval_num_workers,
-            pin_memory=bool(cfg["eval"]["pin_memory"] and video_backend != "dali"),
-            persistent_workers=bool(cfg["eval"]["persistent_workers"]),
-            prefetch_factor=int(cfg["eval"]["prefetch_factor"]),
-            collate_fn=partial(_collate_cached_window_batch, feature_cache=test_cache) if test_cache is not None else eval_collate,
-            batch_sampler=_WindowBatchSampler(test_windows, batch_size=int(cfg["eval"]["batch_size"]), shuffle=False),
-        )
-        loaders["test_loader"] = DataLoader(test_ds, **test_loader_kwargs)
-    return loaders
-
-
-def _make_loaders_compat(cfg: dict[str, Any], include_test: bool = True, *, feature_extractor: nn.Module | None = None, device: torch.device | None = None, runtime=None) -> dict[str, Any]:
-    try:
-        return _make_loaders(cfg, include_test=include_test, feature_extractor=feature_extractor, device=device, runtime=runtime)
-    except TypeError as exc:
-        if "unexpected keyword argument" not in str(exc):
-            raise
-        return _make_loaders(cfg, include_test=include_test)
-
-
-def _build_eval_loader(
-    videos: list[VideoClipRecord],
-    cfg: dict[str, Any],
-    *,
-    batch_size: int | None = None,
-    num_workers: int | None = None,
-    feature_extractor: nn.Module | None = None,
-    device: torch.device | None = None,
-    source: str | None = None,
-) -> DataLoader:
-    dataset_cfg = cfg["dataset"]
-    windows = _build_window_records(
-        videos,
-        past_frames=dataset_cfg["past_frames"],
-        future_frames=dataset_cfg["future_frames"],
-        stride=dataset_cfg["stride"],
-    )
-    video_backend = str(dataset_cfg.get("video_backend", "auto"))
-    ds = ForgeAnomalyWindowDataset(videos, windows, dataset_cfg["image_size"], video_backend=video_backend)
-    ds.reader_cache_size = int(cfg["eval"]["reader_cache_size"])
-    worker_count = int(cfg["eval"]["num_workers"] if num_workers is None else num_workers)
-    cache_store = _resolve_anomaly_feature_cache_store(
-        cfg=cfg,
-        split=str(cfg["eval"].get("split", "test")),
-        windows=windows,
-        videos=videos,
-        feature_extractor=feature_extractor,
-        device=device,
-        source=source,
-    )
-    loader_kwargs = _loader_kwargs(
-        batch_size=int(cfg["eval"]["batch_size"] if batch_size is None else batch_size),
-        num_workers=worker_count,
-        pin_memory=bool(cfg["eval"]["pin_memory"] and video_backend != "dali"),
-        persistent_workers=bool(cfg["eval"]["persistent_workers"]),
-        prefetch_factor=int(cfg["eval"]["prefetch_factor"]),
-        collate_fn=partial(_collate_cached_window_batch, feature_cache=cache_store) if cache_store is not None else partial(
-            _collate_window_batch,
-            image_size=dataset_cfg["image_size"],
-            reader_cache_size=int(cfg["eval"]["reader_cache_size"]),
-            video_backend=video_backend,
-        ),
-        batch_sampler=_WindowBatchSampler(windows, batch_size=int(cfg["eval"]["batch_size"] if batch_size is None else batch_size), shuffle=False),
-    )
-    return DataLoader(ds, **loader_kwargs)
-
-
 def _extract_pair_features(feature_extractor: nn.Module, batch: dict[str, Any], runtime) -> tuple[ExtractedFeatures, ExtractedFeatures]:
     if "past_pooled" in batch:
         # Cached tensors may be stored as fp16/bf16 to save disk; cast to fp32 before
@@ -943,52 +237,6 @@ def _predict_sample_scores(predictor: nn.Module, past_features: ExtractedFeature
     raise ValueError(f"Unsupported predictor_type: {predictor_type}")
 
 
-def _normal_stats(scores: np.ndarray) -> dict[str, float]:
-    return {"mean": float(scores.mean()) if len(scores) else 0.0, "std": float(scores.std()) if len(scores) else 0.0}
-
-
-def _timing_metrics(*, decode_times: list[float], model_times: list[float]) -> dict[str, float]:
-    avg_decode = float(np.mean(decode_times)) if decode_times else 0.0
-    avg_model = float(np.mean(model_times)) if model_times else 0.0
-    return {
-        "avg_decode_time": avg_decode,
-        "avg_model_time": avg_model,
-        "avg_step_time": avg_decode + avg_model,
-    }
-
-
-def _roc_auc_score(labels: np.ndarray, scores: np.ndarray) -> float:
-    labels = labels.astype(np.int64)
-    scores = scores.astype(np.float64)
-    pos = labels == 1
-    neg = labels == 0
-    n_pos = int(pos.sum())
-    n_neg = int(neg.sum())
-    if n_pos == 0 or n_neg == 0:
-        return float("nan")
-    order = np.argsort(scores, kind="mergesort")
-    ranks = np.empty_like(order, dtype=np.float64)
-    ranks[order] = np.arange(len(scores), dtype=np.float64) + 1.0
-    unique_scores, inverse, counts = np.unique(scores, return_inverse=True, return_counts=True)
-    for idx, count in enumerate(counts):
-        if count > 1:
-            mask = inverse == idx
-            ranks[mask] = ranks[mask].mean()
-    sum_pos = ranks[pos].sum()
-    return float((sum_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg))
-
-
-def _smooth_scores(scores: np.ndarray, window: int) -> np.ndarray:
-    if window <= 1 or len(scores) == 0:
-        return scores.astype(np.float32, copy=True)
-    if window % 2 == 0:
-        window += 1
-    pad = window // 2
-    padded = np.pad(scores.astype(np.float32), (pad, pad), mode="edge")
-    kernel = np.ones(window, dtype=np.float32) / float(window)
-    return np.convolve(padded, kernel, mode="valid").astype(np.float32)
-
-
 def _aggregate_scores(loader: DataLoader, predictor: nn.Module, feature_extractor: nn.Module, runtime, desc: str, model_cfg: dict[str, Any]) -> tuple[dict[str, Any], dict[str, float]]:
     by_video: dict[str, dict[str, Any]] = {}
     predictor.eval()
@@ -1029,139 +277,91 @@ def _aggregate_scores(loader: DataLoader, predictor: nn.Module, feature_extracto
     return summary, _timing_metrics(decode_times=decode_times, model_times=model_times)
 
 
-def _finalize_video_summary(by_video: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    summary: dict[str, Any] = {"videos": {}}
-    for video_name, state in by_video.items():
-        frame_ids = sorted(state["predictor_sum"].keys())
-        predictor_series = np.asarray([state["predictor_sum"][idx] / state["predictor_count"][idx] for idx in frame_ids], dtype=np.float32)
-        frozen_series = np.asarray([state["frozen_sum"][idx] / state["frozen_count"][idx] for idx in frame_ids], dtype=np.float32)
-        labels = None
-        if state["has_labels"]:
-            labels = np.asarray([state["labels"].get(idx, 0) for idx in frame_ids], dtype=np.int64)
-        summary["videos"][video_name] = {
-            "frame_ids": frame_ids,
-            "predictor_scores": predictor_series.tolist(),
-            "frozen_scores": frozen_series.tolist(),
-            "labels": None if labels is None else labels.tolist(),
-        }
-    return summary
-
-
-def _flatten_metric_arrays(video_summary: dict[str, Any], key: str) -> tuple[np.ndarray, np.ndarray]:
-    scores: list[float] = []
-    labels: list[int] = []
-    for video in video_summary["videos"].values():
-        if video["labels"] is None:
-            continue
-        scores.extend(video[key])
-        labels.extend(video["labels"])
-    return np.asarray(labels, dtype=np.int64), np.asarray(scores, dtype=np.float32)
-
-
-def _build_smoothed_summary(video_summary: dict[str, Any], smoothing_window: int) -> dict[str, Any]:
-    smoothed: dict[str, Any] = {"videos": {}}
-    for video_name, payload in video_summary["videos"].items():
-        predictor_scores = np.asarray(payload["predictor_scores"], dtype=np.float32)
-        frozen_scores = np.asarray(payload["frozen_scores"], dtype=np.float32)
-        smoothed["videos"][video_name] = {
-            "frame_ids": payload["frame_ids"],
-            "predictor_scores": _smooth_scores(predictor_scores, smoothing_window).tolist(),
-            "frozen_scores": _smooth_scores(frozen_scores, smoothing_window).tolist(),
-            "labels": payload["labels"],
-        }
-    return smoothed
-
-
-def _safe_div(numerator: float, denominator: float) -> float:
-    if denominator == 0:
-        return 0.0
-    return float(numerator / denominator)
-
-
-def _clip_score_rows(video_summary: dict[str, Any], key: str, *, reduction: str = "max") -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for video_name, payload in video_summary["videos"].items():
-        scores = np.asarray(payload[key], dtype=np.float32)
-        labels = None if payload["labels"] is None else np.asarray(payload["labels"], dtype=np.int64)
-        if reduction == "max":
-            clip_score = float(scores.max()) if scores.size else float("nan")
-        elif reduction == "mean":
-            clip_score = float(scores.mean()) if scores.size else float("nan")
-        else:
-            raise ValueError(f"Unsupported clip score reduction: {reduction}")
-        clip_label = None if labels is None else int(np.any(labels != 0))
-        rows.append(
-            {
-                "video_name": video_name,
-                "clip_label": clip_label,
-                "clip_score": clip_score,
-            }
-        )
-    return rows
-
-
-def _clip_level_metrics(video_summary: dict[str, Any], key: str, *, threshold: float, reduction: str = "max") -> dict[str, Any]:
-    rows = _clip_score_rows(video_summary, key, reduction=reduction)
-    labeled_rows = [row for row in rows if row["clip_label"] is not None]
-    labels = np.asarray([row["clip_label"] for row in labeled_rows], dtype=np.int64)
-    scores = np.asarray([row["clip_score"] for row in labeled_rows], dtype=np.float32)
-    predictions = (scores > float(threshold)).astype(np.int64)
-    tp = int(np.sum((labels == 1) & (predictions == 1)))
-    fn = int(np.sum((labels == 1) & (predictions == 0)))
-    tn = int(np.sum((labels == 0) & (predictions == 0)))
-    fp = int(np.sum((labels == 0) & (predictions == 1)))
-    precision = _safe_div(tp, tp + fp)
-    recall = _safe_div(tp, tp + fn)
-    specificity = _safe_div(tn, tn + fp)
-    accuracy = _safe_div(tp + tn, len(rows))
-    f1 = _safe_div(2.0 * precision * recall, precision + recall) if (precision + recall) > 0.0 else 0.0
-    return {
-        "reduction": reduction,
-        "auc": _roc_auc_score(labels, scores),
-        "accuracy": accuracy,
-        "precision": precision,
-        "recall": recall,
-        "specificity": specificity,
-        "f1": f1,
-        "confusion_matrix": {"tn": tn, "fp": fp, "fn": fn, "tp": tp},
-        "counts": {
-            "total": int(len(labeled_rows)),
-            "normal": int(np.sum(labels == 0)),
-            "anomaly": int(np.sum(labels == 1)),
+def _checkpoint_payload(predictor: nn.Module, cfg: dict[str, Any], *, epoch: int, train_loss: float, val_loss: float, best_val_loss: float, effective_lr: float, checkpoint_kind: str) -> dict[str, Any]:
+    return checkpoint_payload(
+        model_state=predictor.state_dict(),
+        optimizer_state=None,
+        scheduler_state=None,
+        epoch=epoch,
+        global_step=0,
+        best_fitness=best_val_loss,
+        metrics={
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "effective_lr": effective_lr,
         },
-        "clips": rows,
-    }
+        config=cfg,
+        task="anomaly",
+        media="video",
+        checkpoint_kind=checkpoint_kind,
+        component="predictor",
+        extras={"effective_lr": effective_lr},
+    )
 
 
-def _threshold_clip_predictions(video_summary: dict[str, Any], key: str, *, threshold: float, reduction: str = "max") -> dict[str, Any]:
-    rows = _clip_score_rows(video_summary, key, reduction=reduction)
-    enriched: list[dict[str, Any]] = []
-    for row in rows:
-        label = row["clip_label"]
-        clip_score = float(row["clip_score"])
-        predicted_label = int(clip_score > float(threshold))
-        enriched.append(
-            {
-                "video_name": row["video_name"],
-                "clip_score": clip_score,
-                "clip_label": label,
-                "predicted_label": predicted_label,
-                "threshold": float(threshold),
-            }
-        )
-    return {
-        "clip_score_reduction": reduction,
-        "threshold": float(threshold),
-        "clips": enriched,
-    }
+def _predictor_state_dict_from_checkpoint(checkpoint: dict[str, Any], checkpoint_path: Path) -> dict[str, Any]:
+    state_dict = checkpoint.get("model_state") or checkpoint.get("predictor_state") or checkpoint.get("extras", {}).get("predictor_state")
+    if state_dict is None:
+        raise ValueError(f"Checkpoint {checkpoint_path} does not contain predictor weights")
+    return state_dict
 
 
-def _predict_output_root(cfg: dict[str, Any], *, split: str | None, source: str | None) -> Path:
+def _resolve_effective_lr(train_cfg: dict[str, Any]) -> tuple[float, dict[str, Any]]:
+    lr_mode = str(train_cfg.get("lr_mode", "manual"))
+    batch_size = int(train_cfg["batch_size"])
+    if lr_mode == "manual":
+        effective_lr = float(train_cfg["lr"])
+    elif lr_mode == "autoscale":
+        reference_batch_size = int(train_cfg["reference_batch_size"])
+        reference_lr = float(train_cfg["reference_lr"])
+        ratio = batch_size / float(reference_batch_size)
+        scale_rule = str(train_cfg.get("lr_scale_rule", "sqrt"))
+        if scale_rule == "sqrt":
+            effective_lr = reference_lr * math.sqrt(ratio)
+        elif scale_rule == "linear":
+            effective_lr = reference_lr * ratio
+        else:
+            raise ValueError(f"Unsupported lr_scale_rule: {scale_rule}")
+    else:
+        raise ValueError(f"Unsupported lr_mode: {lr_mode}")
+    return float(effective_lr), {"lr_mode": lr_mode, "effective_lr": float(effective_lr)}
+
+
+def _resolve_checkpoint_path(cfg: dict[str, Any], section: str) -> Path:
+    explicit_path = cfg[section].get("checkpoint_path")
     output_root = _make_output_root(cfg)
-    base = output_root / "predict"
-    if source:
-        return base / Path(source).stem
-    return base / str(split or "custom")
+    checkpoint_dir = checkpoint_paths(output_root).weights_dir
+    if explicit_path:
+        path = Path(explicit_path)
+        if not path.is_absolute():
+            path = (_repo_root() / path).resolve()
+        return path
+    target = str(cfg[section].get("checkpoint_target", "best"))
+    if target == "best":
+        return checkpoint_dir / "best.pt"
+    if target in {"latest", "last"}:
+        return checkpoint_dir / "last.pt"
+    raise ValueError(f"Unsupported checkpoint target: {target}")
+
+
+class _InferenceWrapper(nn.Module):
+    def __init__(self, feature_extractor: nn.Module, predictor: nn.Module, model_cfg: dict[str, Any]) -> None:
+        super().__init__()
+        self.feature_extractor = feature_extractor
+        self.predictor = predictor
+        self.model_cfg = model_cfg
+        self.tubelet_size = feature_extractor.tubelet_size
+
+    def forward(self, past: torch.Tensor, future: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        past_feat = self.feature_extractor(past)
+        future_feat = self.feature_extractor(future)
+        return _predict_sample_scores(
+            self.predictor,
+            past_feat,
+            future_feat,
+            self.model_cfg,
+            tubelet_size=self.tubelet_size,
+        )
 
 
 def _render_timeline_strip(
@@ -1241,86 +441,6 @@ def _render_prediction_video(
             writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
     finally:
         writer.release()
-
-
-def _checkpoint_payload(predictor: nn.Module, cfg: dict[str, Any], *, epoch: int, train_loss: float, val_loss: float, best_val_loss: float, effective_lr: float, checkpoint_kind: str) -> dict[str, Any]:
-    return checkpoint_payload(
-        model_state=predictor.state_dict(),
-        optimizer_state=None,
-        scheduler_state=None,
-        epoch=epoch,
-        global_step=0,
-        best_fitness=best_val_loss,
-        metrics={
-            "train_loss": train_loss,
-            "val_loss": val_loss,
-            "effective_lr": effective_lr,
-        },
-        config=cfg,
-        task="anomaly",
-        media="video",
-        checkpoint_kind=checkpoint_kind,
-        component="predictor",
-        extras={"effective_lr": effective_lr},
-    )
-
-
-def _predictor_state_dict_from_checkpoint(checkpoint: dict[str, Any], checkpoint_path: Path) -> dict[str, Any]:
-    state_dict = checkpoint.get("model_state") or checkpoint.get("predictor_state") or checkpoint.get("extras", {}).get("predictor_state")
-    if state_dict is None:
-        raise ValueError(f"Checkpoint {checkpoint_path} does not contain predictor weights")
-    return state_dict
-
-
-def _resolve_effective_lr(train_cfg: dict[str, Any]) -> tuple[float, dict[str, Any]]:
-    lr_mode = str(train_cfg.get("lr_mode", "manual"))
-    batch_size = int(train_cfg["batch_size"])
-    if lr_mode == "manual":
-        effective_lr = float(train_cfg["lr"])
-    elif lr_mode == "autoscale":
-        reference_batch_size = int(train_cfg["reference_batch_size"])
-        reference_lr = float(train_cfg["reference_lr"])
-        ratio = batch_size / float(reference_batch_size)
-        scale_rule = str(train_cfg.get("lr_scale_rule", "sqrt"))
-        if scale_rule == "sqrt":
-            effective_lr = reference_lr * math.sqrt(ratio)
-        elif scale_rule == "linear":
-            effective_lr = reference_lr * ratio
-        else:
-            raise ValueError(f"Unsupported lr_scale_rule: {scale_rule}")
-    else:
-        raise ValueError(f"Unsupported lr_mode: {lr_mode}")
-    return float(effective_lr), {"lr_mode": lr_mode, "effective_lr": float(effective_lr)}
-
-
-def _resolve_checkpoint_path(cfg: dict[str, Any], section: str) -> Path:
-    explicit_path = cfg[section].get("checkpoint_path")
-    output_root = _make_output_root(cfg)
-    checkpoint_dir = checkpoint_paths(output_root).weights_dir
-    if explicit_path:
-        path = Path(explicit_path)
-        if not path.is_absolute():
-            path = (_repo_root() / path).resolve()
-        return path
-    target = str(cfg[section].get("checkpoint_target", "best"))
-    if target == "best":
-        return checkpoint_dir / "best.pt"
-    if target in {"latest", "last"}:
-        return checkpoint_dir / "last.pt"
-    raise ValueError(f"Unsupported checkpoint target: {target}")
-
-
-def _thresholds_from_smoothed_summary(smoothed: dict[str, Any], cfg: dict[str, Any]) -> tuple[float, float, np.ndarray, np.ndarray, np.ndarray]:
-    calibration_labels, calibration_scores_pred = _flatten_metric_arrays(smoothed, "predictor_scores")
-    _, calibration_scores_frozen = _flatten_metric_arrays(smoothed, "frozen_scores")
-    pred_reference = calibration_scores_pred[calibration_labels == 0] if np.any(calibration_labels == 0) else calibration_scores_pred
-    frozen_reference = calibration_scores_frozen[calibration_labels == 0] if np.any(calibration_labels == 0) else calibration_scores_frozen
-    pred_stats = _normal_stats(pred_reference)
-    frozen_stats = _normal_stats(frozen_reference)
-    multiplier = cfg["eval"]["threshold_std_multiplier"]
-    predictor_threshold = float(pred_stats["mean"] + multiplier * pred_stats["std"])
-    frozen_threshold = float(frozen_stats["mean"] + multiplier * frozen_stats["std"])
-    return predictor_threshold, frozen_threshold, calibration_labels, calibration_scores_pred, calibration_scores_frozen
 
 
 def train_from_runtime_config(config: dict[str, Any]) -> AnomalyTrainResult:

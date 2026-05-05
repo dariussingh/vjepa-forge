@@ -30,6 +30,16 @@ data:
   past_frames: 8
   future_frames: 8
   stride: 1
+  augment:
+    enabled: false
+    random_hflip: 0.5
+    random_vflip: 0.0
+    random_resized_crop: null
+    color_jitter: null
+    gaussian_blur: null
+    random_grayscale: 0.0
+    normalize_mean: [0.485, 0.456, 0.406]
+    normalize_std: [0.229, 0.224, 0.225]
 train:
   epochs: 1
   batch_size: 2
