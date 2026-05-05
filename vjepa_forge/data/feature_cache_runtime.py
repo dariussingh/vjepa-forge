@@ -142,6 +142,7 @@ def resolve_generic_cache_store(
         resolved_batch_size = int(data_cfg.get("feature_cache_batch_size") or batch_size or data_cfg.get("batch_size", 32))
         resolved_workers = num_workers
         amp_dtype = runtime.amp_dtype if runtime is not None else None
+        cache_dtype = _resolve_cache_dtype(str(data_cfg.get("feature_cache_dtype", "fp16")))
         build_generic_feature_cache(
             store=store,
             spec=spec,
@@ -157,12 +158,22 @@ def resolve_generic_cache_store(
             batch_size=resolved_batch_size,
             num_workers=resolved_workers,
             amp_dtype=amp_dtype,
+            cache_dtype=cache_dtype,
         )
     elif settings.validate and not store.spec_matches(spec):
         if settings.enabled == "true":
             raise ValueError(f"Feature cache spec mismatch for split={split}: {store.cache_dir}")
         return None
     return store
+
+
+def _resolve_cache_dtype(dtype_str: str) -> torch.dtype | None:
+    lowered = str(dtype_str).lower()
+    if lowered == "fp16":
+        return torch.float16
+    if lowered in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    return None  # fp32 — keep as-is
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +261,7 @@ def build_generic_feature_cache(
     batch_size: int = 32,
     num_workers: int | None = None,
     amp_dtype: torch.dtype | None = None,
+    cache_dtype: torch.dtype | None = torch.float16,
 ) -> None:
     model.backbone.eval()
     device = next(model.parameters()).device
@@ -318,4 +330,8 @@ def build_generic_feature_cache(
                         x = x.permute(0, 2, 1, 3, 4).contiguous()
                     items = model.backbone.build_cache_items_batch(x, media=dataset.media, split_layer=split_layer)
                     for key, item in zip(batch["keys"], items):
+                        if cache_dtype is not None:
+                            item.cached_outputs = [t.to(dtype=cache_dtype) for t in item.cached_outputs]
+                            if item.token_state is not None:
+                                item.token_state = item.token_state.to(dtype=cache_dtype)
                         writer.append(key, item)

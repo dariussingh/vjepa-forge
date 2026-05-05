@@ -226,6 +226,7 @@ def _build_cfg(config: dict[str, Any], *, action: str) -> dict[str, Any]:
             "feature_cache_build_on_miss": bool(data_cfg.get("feature_cache_build_on_miss", True)),
             "feature_cache_readonly": bool(data_cfg.get("feature_cache_readonly", False)),
             "feature_cache_shard_size": int(data_cfg.get("feature_cache_shard_size", 64)),
+            "feature_cache_dtype": str(data_cfg.get("feature_cache_dtype", "fp16")),
         },
         "model": {
             "name": str(model_cfg.get("name", "vjepa2_1_vit_base_384")),
@@ -318,7 +319,17 @@ def _feature_cache_settings(cfg: dict[str, Any]) -> dict[str, Any]:
         "build_on_miss": bool(cfg["dataset"].get("feature_cache_build_on_miss", True)),
         "readonly": bool(cfg["dataset"].get("feature_cache_readonly", False)),
         "shard_size": max(1, int(cfg["dataset"].get("feature_cache_shard_size", 64))),
+        "dtype": str(cfg["dataset"].get("feature_cache_dtype", "fp16")),
     }
+
+
+def _resolve_cache_dtype(dtype_str: str) -> torch.dtype | None:
+    lowered = str(dtype_str).lower()
+    if lowered == "fp16":
+        return torch.float16
+    if lowered in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    return None  # fp32 / keep as-is
 
 
 def _anomaly_cache_spec(cfg: dict[str, Any], *, split: str, source: str | None = None) -> dict[str, Any]:
@@ -353,6 +364,7 @@ def _build_anomaly_feature_cache(
     batch_size: int | None = None,
     num_workers: int | None = None,
     amp_dtype: torch.dtype | None = None,
+    cache_dtype: torch.dtype | None = torch.float16,
 ) -> None:
     """Build the anomaly feature cache using batched DataLoader for GPU efficiency.
 
@@ -445,16 +457,22 @@ def _build_anomaly_feature_cache(
                             clip_len=int(batch["clip_len"][b]),
                             stride=1,
                         )
+                        def _to_cache(t: torch.Tensor) -> torch.Tensor:
+                            out = t.detach()
+                            if cache_dtype is not None:
+                                out = out.to(dtype=cache_dtype)
+                            return out.cpu()
+
                         item = CachedFeatureItem(
                             mode="final",
                             media="video",
                             split_layer=-1,
                             token_state=None,
                             cached_outputs=[
-                                past_feat.pooled[b].detach().cpu(),
-                                past_feat.tokens[b].detach().cpu(),
-                                future_feat.pooled[b].detach().cpu(),
-                                future_feat.tokens[b].detach().cpu(),
+                                _to_cache(past_feat.pooled[b]),
+                                _to_cache(past_feat.tokens[b]),
+                                _to_cache(future_feat.pooled[b]),
+                                _to_cache(future_feat.tokens[b]),
                             ],
                             height_patches=height_patches,
                             width_patches=width_patches,
@@ -498,6 +516,7 @@ def _resolve_anomaly_feature_cache_store(
             device=device,
             shard_size=int(settings["shard_size"]),
             amp_dtype=runtime.amp_dtype if runtime is not None else None,
+            cache_dtype=_resolve_cache_dtype(settings["dtype"]),
         )
     elif store.load_manifest().get("spec") != spec and settings["enabled"] == "true":
         raise ValueError(f"Anomaly feature cache spec mismatch: {store.cache_dir}")
