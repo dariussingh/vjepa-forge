@@ -135,7 +135,7 @@ def _build_cfg(config: dict[str, Any], *, action: str) -> dict[str, Any]:
             "early_stopping": dict(config["train"].get("early_stopping", {})),
         },
         "eval": {
-            "batch_size": int(config["val"].get("batch_size", config["train"].get("batch_size", 1))),
+            "batch_size": int(config["val"].get("batch_size") or config["train"].get("batch_size", 1)),
             "num_workers": int(config["val"].get("num_workers", default_workers)),
             "prefetch_factor": int(config["val"].get("prefetch_factor", 2)),
             "persistent_workers": bool(config["val"].get("persistent_workers", True)),

@@ -4,7 +4,7 @@ import sys
 from typing import Any
 
 from vjepa_forge.cfg.loader import load_runtime_config, parse_override_value
-from vjepa_forge.data.converters import convert_cafe_to_forge
+from vjepa_forge.data.converters import convert_cafe_to_forge, convert_cuhk_avenue_to_forge
 from vjepa_forge.engine.exporter import Exporter
 from vjepa_forge.engine.model import ForgeModel
 from vjepa_forge.tasks.anomaly.runtime import export_from_runtime_config, predict_from_runtime_config, train_from_runtime_config, validate_from_runtime_config
@@ -34,6 +34,11 @@ def main() -> None:
             if not source or not out:
                 raise SystemExit("forge convert cafe requires source=<path> and out=<path>")
             print(convert_cafe_to_forge(source, out))
+            return
+        if action == "cuhk_avenue":
+            if not source or not out:
+                raise SystemExit("forge convert cuhk_avenue requires source=<path> and out=<path>")
+            print(convert_cuhk_avenue_to_forge(source, out))
             return
         raise SystemExit(f"Unknown converter: {action}")
     if action == "export" and not overrides.get("data"):

@@ -63,14 +63,14 @@ train:
   lr_scale_rule: sqrt
   seed: 7
 val:
-  batch_size: 2
+  batch_size: null
   num_workers: 0
   prefetch_factor: 2
   persistent_workers: true
   pin_memory: true
   reader_cache_size: 4
   split: val
-  threshold_std_multiplier: 3.0
+  threshold_std_multiplier: 1.0
   smoothing_window: 9
   checkpoint_target: best
   checkpoint_path: null
