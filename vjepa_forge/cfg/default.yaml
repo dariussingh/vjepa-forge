@@ -26,6 +26,7 @@ data:
   feature_cache_shard_size: 64
   feature_cache_batch_size: null
   feature_cache_dtype: fp16
+  train_fraction: 1.0
   past_frames: 8
   future_frames: 8
   stride: 1

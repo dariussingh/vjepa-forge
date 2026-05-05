@@ -227,6 +227,7 @@ def _build_cfg(config: dict[str, Any], *, action: str) -> dict[str, Any]:
             "feature_cache_readonly": bool(data_cfg.get("feature_cache_readonly", False)),
             "feature_cache_shard_size": int(data_cfg.get("feature_cache_shard_size", 64)),
             "feature_cache_dtype": str(data_cfg.get("feature_cache_dtype", "fp16")),
+            "train_fraction": float(data_cfg.get("train_fraction", 1.0)),
         },
         "model": {
             "name": str(model_cfg.get("name", "vjepa2_1_vit_base_384")),
@@ -348,7 +349,18 @@ def _anomaly_cache_spec(cfg: dict[str, Any], *, split: str, source: str | None =
         "checkpoint": str(cfg["model"]["checkpoint"]),
         "checkpoint_key": str(cfg["model"]["checkpoint_key"]),
         "predictor_type": str(cfg["model"]["predictor_type"]),
+        # fraction and seed are part of the spec so different fractions get different cache dirs
+        "train_fraction": float(cfg["dataset"].get("train_fraction", 1.0)) if split == "train" else 1.0,
+        "train_seed": int(cfg["train"].get("seed", 0)),
     }
+
+
+def _subsample_videos(videos: list[VideoClipRecord], fraction: float, seed: int) -> list[VideoClipRecord]:
+    """Deterministically sample `fraction` of videos using the given seed."""
+    if fraction >= 1.0 or not videos:
+        return videos
+    k = max(1, int(round(len(videos) * fraction)))
+    return random.Random(seed).sample(videos, k)
 
 
 def _build_anomaly_feature_cache(
@@ -702,6 +714,9 @@ def _loader_kwargs(
 def _make_loaders(cfg: dict[str, Any], include_test: bool = True, *, feature_extractor: nn.Module | None = None, device: torch.device | None = None, runtime=None) -> dict[str, Any]:
     dataset_cfg = cfg["dataset"]
     train_videos = _build_video_records(dataset_cfg["dataset_yaml"], split="train")
+    train_fraction = float(dataset_cfg.get("train_fraction", 1.0))
+    train_seed = int(cfg["train"].get("seed", 0))
+    train_videos = _subsample_videos(train_videos, train_fraction, train_seed)
     val_split = cfg["eval"].get("split", "val")
     val_videos = _build_video_records(dataset_cfg["dataset_yaml"], split=val_split)
     test_videos = _build_video_records(dataset_cfg["dataset_yaml"], split="test") if include_test else []

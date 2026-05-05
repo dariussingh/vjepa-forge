@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import os
+import random as _random_module
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -96,6 +97,7 @@ def build_generic_cache_spec(
             "checkpoint_key": str(model.model_cfg.get("backbone", {}).get("checkpoint_key", "ema_encoder")),
             "output_layers": list(getattr(model.backbone.image_backbone, "out_layers", [])),
             "split_layer": int(split_layer),
+            "train_fraction": float(data_cfg.get("train_fraction", 1.0)) if split == "train" else 1.0,
         }
     )
 
@@ -143,6 +145,8 @@ def resolve_generic_cache_store(
         resolved_workers = num_workers
         amp_dtype = runtime.amp_dtype if runtime is not None else None
         cache_dtype = _resolve_cache_dtype(str(data_cfg.get("feature_cache_dtype", "fp16")))
+        train_fraction = float(data_cfg.get("train_fraction", 1.0)) if split == "train" else 1.0
+        train_seed = int(data_cfg.get("train", {}).get("seed", 0)) if isinstance(data_cfg.get("train"), dict) else 0
         build_generic_feature_cache(
             store=store,
             spec=spec,
@@ -159,6 +163,8 @@ def resolve_generic_cache_store(
             num_workers=resolved_workers,
             amp_dtype=amp_dtype,
             cache_dtype=cache_dtype,
+            train_fraction=train_fraction,
+            train_seed=train_seed,
         )
     elif settings.validate and not store.spec_matches(spec):
         if settings.enabled == "true":
@@ -262,6 +268,8 @@ def build_generic_feature_cache(
     num_workers: int | None = None,
     amp_dtype: torch.dtype | None = None,
     cache_dtype: torch.dtype | None = torch.float16,
+    train_fraction: float = 1.0,
+    train_seed: int = 0,
 ) -> None:
     model.backbone.eval()
     device = next(model.parameters()).device
@@ -277,12 +285,16 @@ def build_generic_feature_cache(
         resolved_workers = max(2, min(8, os.cpu_count() or 1))
 
     if tqdm is not None:
+        fraction_str = f", fraction={train_fraction:.2f}" if train_fraction < 1.0 else ""
         tqdm.write(
             f"building feature cache at {store.cache_dir} "
-            f"(batch_size={batch_size}, workers={resolved_workers}, backend={'dali' if use_dali else video_backend if dataset.media == 'video' else image_backend})"
+            f"(batch_size={batch_size}, workers={resolved_workers}, backend={'dali' if use_dali else video_backend if dataset.media == 'video' else image_backend}{fraction_str})"
         )
 
     torch_dataset = _ForgeRecordDataset(dataset)
+    if train_fraction < 1.0 and torch_dataset._records:
+        k = max(1, int(round(len(torch_dataset._records) * train_fraction)))
+        torch_dataset._records = _random_module.Random(train_seed).sample(torch_dataset._records, k)
     collate_fn = functools.partial(
         _cache_build_collate_fn,
         records=dataset.records,
