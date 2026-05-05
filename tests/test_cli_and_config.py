@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from vjepa_forge.cfg.loader import load_runtime_config
+from vjepa_forge.cfg.loader import load_recipe_config, load_runtime_config
 from vjepa_forge.cli.main import parse_kv_pairs
 
 
@@ -31,3 +31,10 @@ def test_cafe_dataset_cfg_is_shipped():
     config = load_runtime_config(task="anomaly", mode="train", model="vjepa21-predictor.yaml", data="cafe.yaml")
     assert config["data"]["task"] == "anomaly"
     assert config["data"]["media"] == "video"
+
+
+def test_legacy_recipe_configs_resolve_from_cfg_package():
+    config = load_recipe_config("kinetics400_vitb.yaml")
+    assert Path(config["_path"]).parts[-4:] == ("cfg", "recipes", "classification", "kinetics400_vitb.yaml")
+    assert config["task"] == "classify"
+    assert config["media"] == "video"

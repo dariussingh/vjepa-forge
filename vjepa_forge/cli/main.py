@@ -62,6 +62,7 @@ def main() -> None:
     model_cfg["num_classes"] = max(len(config["data"].get("names", {})), int(model_cfg.get("num_classes", 2)))
     runtime_data = dict(config["data"])
     runtime_data.update(config.get(action, {}))
+    runtime_data["distributed"] = dict(config.get("distributed", {}))
     runtime_data["image_size"] = int(runtime_data.get("image_size", model_cfg.get("image_size", 384)))
     forge_model = ForgeModel(model_cfg, data=runtime_data)
     if action == "train":

@@ -73,3 +73,13 @@ export:
   checkpoint_path: null
 output:
   root: outputs/vjepa-forge
+distributed:
+  backend: torchrun
+  strategy: ddp
+  precision: fp32
+  sync_batchnorm: false
+  compile: false
+  compile_mode: reduce-overhead
+  tf32: true
+  channels_last: false
+  ddp_eval: false

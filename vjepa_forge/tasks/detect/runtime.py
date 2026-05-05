@@ -58,7 +58,9 @@ class DetectTrainer(BaseTrainer):
 
 class DetectValidator(BaseTrainer):
     def run(self) -> ValidationResult:
-        self.model.to(self.device)
+        if self.device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
+        self.model = self.model.to(self.device)
         self.model.eval()
         split = str(getattr(self, "split", "val"))
         loader = self.build_loader(split=split)
@@ -66,12 +68,13 @@ class DetectValidator(BaseTrainer):
         batches = 0
         decoded_predictions: list[dict[str, torch.Tensor]] = []
         decoded_targets: list[dict[str, torch.Tensor]] = []
-        with torch.no_grad():
+        with self.runtime.inference_context():
             progress = _progress(loader, desc=f"{split}", total=len(loader))
             for batch in progress:
-                batch.x = batch.x.to(self.device)
-                outputs = self.model(batch)
-                loss, _ = self.model.head.compute_detection_loss(outputs, batch.labels)
+                batch = self.move_batch_to_device(batch)
+                outputs = self.forward_pass(self.model, batch)
+                with self.runtime.autocast_context():
+                    loss, _ = self.model.head.compute_detection_loss(outputs, batch.labels)
                 total += float(loss.detach().cpu().item())
                 batches += 1
                 decoded_predictions.extend(self.model.head.decode_predictions(outputs))
@@ -85,17 +88,19 @@ class DetectValidator(BaseTrainer):
 
 class DetectPredictor(BaseTrainer):
     def run(self) -> PredictResult:
-        self.model.to(self.device)
+        if self.device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
+        self.model = self.model.to(self.device)
         self.model.eval()
         split = str(getattr(self, "split", "val"))
         loader = self.build_loader(split=split)
         results: list[Any] = []
         summary_predictions: list[dict[str, torch.Tensor]] = []
-        with torch.no_grad():
+        with self.runtime.inference_context():
             progress = _progress(loader, desc=f"predict:{split}", total=len(loader))
             for batch in progress:
-                batch.x = batch.x.to(self.device)
-                outputs = self.model(batch)
+                batch = self.move_batch_to_device(batch)
+                outputs = self.forward_pass(self.model, batch)
                 decoded = self.model.head.decode_predictions(outputs)
                 results.append(decoded)
                 summary_predictions.extend(decoded)

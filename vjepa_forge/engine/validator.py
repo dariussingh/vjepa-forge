@@ -19,18 +19,21 @@ class ValidationResult:
 
 class BaseValidator(BaseTrainer):
     def run(self) -> ValidationResult:
-        self.model.to(self.device)
+        if self.device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
+        self.model = self.model.to(self.device)
         self.model.eval()
         split = str(getattr(self, "split", "val"))
         loader = self.build_loader(split=split)
         total = 0.0
         batches = 0
-        with torch.no_grad():
+        with self.runtime.inference_context():
             progress = self.progress(loader, desc=f"{split}", total=len(loader))
             for batch in progress:
-                batch.x = batch.x.to(self.device)
-                outputs = self.model(batch)
-                total += float(self.compute_loss(batch, outputs).detach().cpu().item())
+                batch = self.move_batch_to_device(batch)
+                outputs = self.forward_pass(self.model, batch)
+                with self.runtime.autocast_context():
+                    total += float(self.compute_loss(batch, outputs).detach().cpu().item())
                 batches += 1
                 if batches > 0 and progress is not loader:
                     progress.set_postfix(loss=f"{(total / batches):.4f}")

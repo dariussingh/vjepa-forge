@@ -20,6 +20,7 @@ from vjepa_forge.data.forge.dataset import ForgeDataset
 from vjepa_forge.data.video import get_video_frame_count, read_video_clip, read_video_clips, read_video_frames_uint8
 from vjepa_forge.engine.checkpointing import checkpoint_paths, checkpoint_payload, load_checkpoint, resolve_resume_path, resolve_run_dir, results_csv_rows, save_checkpoint, write_results_csv
 from vjepa_forge.engine.optimization import build_scheduler, build_train_settings, normalize_stages, resolve_autoscaled_lr
+from vjepa_forge.engine.runtime import setup_runtime
 from vjepa_forge.heads.anomaly.modeling import ExtractedFeatures, build_feature_extractor, build_predictor
 from vjepa_forge.losses.anomaly import anomaly_future_prediction_loss
 
@@ -169,12 +170,6 @@ def _seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def _resolve_device(device_str: str) -> torch.device:
-    if device_str == "cuda" and torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
-
-
 def _make_output_root(cfg: dict[str, Any]) -> Path:
     source = cfg.get("predict", {}).get("source") if cfg.get("action") == "predict" else None
     return resolve_run_dir(
@@ -298,6 +293,7 @@ def _build_cfg(config: dict[str, Any], *, action: str) -> dict[str, Any]:
             "checkpoint_path": config["export"].get("checkpoint_path"),
         },
         "output": {"root": output_root},
+        "distributed": dict(config.get("distributed", {})),
     }
 
 
@@ -371,7 +367,6 @@ def _collate_window_batch(batch: list[dict[str, Any]], *, image_size: int, reade
     if not batch:
         return {}
     decode_start = time.perf_counter()
-    effective_backend = "decord" if str(video_backend).lower() == "dali" else video_backend
 
     # Group by video path so each video is decoded once.
     # _WindowBatchSampler already co-locates windows from the same video,
@@ -392,7 +387,7 @@ def _collate_window_batch(batch: list[dict[str, Any]], *, image_size: int, reade
             stride=1,
             image_size=image_size,
             reader_cache_size=reader_cache_size,
-            video_backend=effective_backend,
+            video_backend=video_backend,
         )
         for i in indices:
             s = int(batch[i]["clip_start"]) - min_start
@@ -551,12 +546,13 @@ def _build_eval_loader(
     return DataLoader(ds, **loader_kwargs)
 
 
-def _extract_pair_features(feature_extractor: nn.Module, batch: dict[str, Any], device: torch.device) -> tuple[ExtractedFeatures, ExtractedFeatures]:
-    past = batch["past"].to(device, non_blocking=True)
-    future = batch["future"].to(device, non_blocking=True)
+def _extract_pair_features(feature_extractor: nn.Module, batch: dict[str, Any], runtime) -> tuple[ExtractedFeatures, ExtractedFeatures]:
+    past = runtime.move_tensor(batch["past"])
+    future = runtime.move_tensor(batch["future"])
     with torch.no_grad():
-        past_feat = feature_extractor(past)
-        future_feat = feature_extractor(future)
+        with runtime.autocast_context():
+            past_feat = feature_extractor(past)
+            future_feat = feature_extractor(future)
     return past_feat, future_feat
 
 
@@ -653,7 +649,7 @@ def _smooth_scores(scores: np.ndarray, window: int) -> np.ndarray:
     return np.convolve(padded, kernel, mode="valid").astype(np.float32)
 
 
-def _aggregate_scores(loader: DataLoader, predictor: nn.Module, feature_extractor: nn.Module, device: torch.device, desc: str, model_cfg: dict[str, Any]) -> tuple[dict[str, Any], dict[str, float]]:
+def _aggregate_scores(loader: DataLoader, predictor: nn.Module, feature_extractor: nn.Module, runtime, desc: str, model_cfg: dict[str, Any]) -> tuple[dict[str, Any], dict[str, float]]:
     by_video: dict[str, dict[str, Any]] = {}
     predictor.eval()
     decode_times: list[float] = []
@@ -661,14 +657,15 @@ def _aggregate_scores(loader: DataLoader, predictor: nn.Module, feature_extracto
     for batch in _progress(loader, desc=desc, total=len(loader)):
         decode_times.append(float(batch.get("decode_time", 0.0)))
         model_start = time.perf_counter()
-        past_feat, future_feat = _extract_pair_features(feature_extractor, batch, device)
-        predictor_scores_t, frozen_scores_t = _predict_sample_scores(
-            predictor,
-            past_feat,
-            future_feat,
-            model_cfg,
-            tubelet_size=feature_extractor.tubelet_size,
-        )
+        past_feat, future_feat = _extract_pair_features(feature_extractor, batch, runtime)
+        with runtime.autocast_context():
+            predictor_scores_t, frozen_scores_t = _predict_sample_scores(
+                predictor,
+                past_feat,
+                future_feat,
+                model_cfg,
+                tubelet_size=feature_extractor.tubelet_size,
+            )
         model_times.append(float(time.perf_counter() - model_start))
         predictor_scores = predictor_scores_t.detach().cpu().numpy()
         frozen_scores = frozen_scores_t.detach().cpu().numpy()
@@ -990,7 +987,10 @@ def train_from_runtime_config(config: dict[str, Any]) -> AnomalyTrainResult:
     cfg = _build_cfg(config, action="train")
     if int(cfg["train"]["num_workers"]) > 0:
         torch.multiprocessing.set_sharing_strategy("file_system")
-    device = _resolve_device(cfg["train"]["device"])
+    runtime = setup_runtime(device=cfg["train"]["device"], data_cfg={"distributed": cfg.get("distributed", {})})
+    device = runtime.device
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
     _seed_everything(cfg["train"]["seed"])
     loaders = _make_loaders(cfg, include_test=False)
     output_root = _make_output_root(cfg)
@@ -1006,7 +1006,7 @@ def train_from_runtime_config(config: dict[str, Any]) -> AnomalyTrainResult:
         image_size=cfg["dataset"]["image_size"],
         device=device,
     )
-    predictor = build_predictor(cfg["model"], feature_extractor).to(device)
+    predictor = runtime.prepare_module(build_predictor(cfg["model"], feature_extractor), training=True)
     train_settings = build_train_settings(cfg["train"], epochs=int(cfg["train"]["epochs"]), batch_size=int(cfg["train"]["batch_size"]))
     backbone_ref = getattr(feature_extractor, "encoder", feature_extractor)
     optimization_host = type("AnomalyOptimizationHost", (), {"backbone": backbone_ref, "head": predictor})()
@@ -1057,11 +1057,17 @@ def train_from_runtime_config(config: dict[str, Any]) -> AnomalyTrainResult:
         for batch in train_bar:
             train_decode_times.append(float(batch.get("decode_time", 0.0)))
             model_start = time.perf_counter()
-            past_feat, future_feat = _extract_pair_features(feature_extractor, batch, device)
-            loss, _ = anomaly_future_prediction_loss(predictor, past_feat, future_feat, cfg["model"])
+            past_feat, future_feat = _extract_pair_features(feature_extractor, batch, runtime)
+            with runtime.autocast_context():
+                loss, _ = anomaly_future_prediction_loss(predictor, past_feat, future_feat, cfg["model"])
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
+            if runtime.scaler is not None:
+                runtime.scaler.scale(loss).backward()
+                runtime.scaler.step(optimizer)
+                runtime.scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
             scheduler.step(global_step)
             train_model_times.append(float(time.perf_counter() - model_start))
             train_losses.append(float(loss.item()))
@@ -1073,20 +1079,21 @@ def train_from_runtime_config(config: dict[str, Any]) -> AnomalyTrainResult:
         val_decode_times: list[float] = []
         val_model_times: list[float] = []
         val_by_video: dict[str, dict[str, Any]] = {}
-        with torch.no_grad():
+        with runtime.inference_context():
             val_bar = _progress(loaders["val_loader"], desc=f"val {epoch}/{cfg['train']['epochs']}", total=len(loaders["val_loader"]))
             for batch in val_bar:
                 val_decode_times.append(float(batch.get("decode_time", 0.0)))
                 model_start = time.perf_counter()
-                past_feat, future_feat = _extract_pair_features(feature_extractor, batch, device)
-                predictor_scores_t, frozen_scores_t = _predict_sample_scores(
-                    predictor,
-                    past_feat,
-                    future_feat,
-                    cfg["model"],
-                    tubelet_size=feature_extractor.tubelet_size,
-                )
-                val_loss_value = float(anomaly_future_prediction_loss(predictor, past_feat, future_feat, cfg["model"])[0].item())
+                past_feat, future_feat = _extract_pair_features(feature_extractor, batch, runtime)
+                with runtime.autocast_context():
+                    predictor_scores_t, frozen_scores_t = _predict_sample_scores(
+                        predictor,
+                        past_feat,
+                        future_feat,
+                        cfg["model"],
+                        tubelet_size=feature_extractor.tubelet_size,
+                    )
+                    val_loss_value = float(anomaly_future_prediction_loss(predictor, past_feat, future_feat, cfg["model"])[0].item())
                 val_model_times.append(float(time.perf_counter() - model_start))
                 val_losses.append(val_loss_value)
                 predictor_scores = predictor_scores_t.detach().cpu().numpy()
@@ -1216,7 +1223,10 @@ def train_from_runtime_config(config: dict[str, Any]) -> AnomalyTrainResult:
 def _run_eval(config: dict[str, Any], *, split: str) -> tuple[dict[str, Any], Path]:
     cfg = _build_cfg(config, action="val")
     cfg["eval"]["split"] = split
-    device = _resolve_device(cfg["train"]["device"])
+    runtime = setup_runtime(device=cfg["train"]["device"], data_cfg={"distributed": cfg.get("distributed", {})})
+    device = runtime.device
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
     loaders = _make_loaders(cfg, include_test=True)
     output_root = _make_output_root(cfg)
     reports = output_root / "reports"
@@ -1231,7 +1241,7 @@ def _run_eval(config: dict[str, Any], *, split: str) -> tuple[dict[str, Any], Pa
         image_size=cfg["dataset"]["image_size"],
         device=device,
     )
-    predictor = build_predictor(cfg["model"], feature_extractor).to(device)
+    predictor = runtime.prepare_module(build_predictor(cfg["model"], feature_extractor).eval(), training=False)
     checkpoint_path = _resolve_checkpoint_path(cfg, "eval")
     checkpoint = load_checkpoint(checkpoint_path)
     predictor.load_state_dict(_predictor_state_dict_from_checkpoint(checkpoint, checkpoint_path))
@@ -1240,7 +1250,7 @@ def _run_eval(config: dict[str, Any], *, split: str) -> tuple[dict[str, Any], Pa
         loaders["val_loader"] if split == "val" else loaders["test_loader"],
         predictor,
         feature_extractor,
-        device,
+        runtime,
         desc=f"score {split}",
         model_cfg=cfg["model"],
     )
@@ -1251,7 +1261,7 @@ def _run_eval(config: dict[str, Any], *, split: str) -> tuple[dict[str, Any], Pa
             loaders["val_loader"],
             predictor,
             feature_extractor,
-            device,
+            runtime,
             desc="score val (threshold calibration)",
             model_cfg=cfg["model"],
         )
@@ -1321,7 +1331,10 @@ def _run_predict(config: dict[str, Any]) -> tuple[dict[str, Any], Path, list[str
     split = None if source else str(cfg["predict"].get("split", "test"))
     if split not in {None, "val", "test"}:
         split = "test"
-    device = _resolve_device(cfg["train"]["device"])
+    runtime = setup_runtime(device=cfg["train"]["device"], data_cfg={"distributed": cfg.get("distributed", {})})
+    device = runtime.device
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
     output_root = _make_output_root(cfg)
     reports = output_root / "reports"
     reports.mkdir(parents=True, exist_ok=True)
@@ -1335,7 +1348,7 @@ def _run_predict(config: dict[str, Any]) -> tuple[dict[str, Any], Path, list[str
         image_size=cfg["dataset"]["image_size"],
         device=device,
     )
-    predictor = build_predictor(cfg["model"], feature_extractor).to(device)
+    predictor = runtime.prepare_module(build_predictor(cfg["model"], feature_extractor).eval(), training=False)
     checkpoint_path = _resolve_checkpoint_path(cfg, "eval")
     checkpoint = load_checkpoint(checkpoint_path)
     predictor.load_state_dict(_predictor_state_dict_from_checkpoint(checkpoint, checkpoint_path))
@@ -1354,7 +1367,7 @@ def _run_predict(config: dict[str, Any]) -> tuple[dict[str, Any], Path, list[str
         videos = loaders["val_videos"] if split == "val" else loaders["test_videos"]
         loader = loaders["val_loader"] if split == "val" else loaders["test_loader"]
         desc = f"predict:{split}"
-    summary, timings = _aggregate_scores(loader, predictor, feature_extractor, device, desc=desc, model_cfg=cfg["model"])
+    summary, timings = _aggregate_scores(loader, predictor, feature_extractor, runtime, desc=desc, model_cfg=cfg["model"])
     smoothed = _build_smoothed_summary(summary, int(cfg["eval"].get("smoothing_window", 1)))
     report_stem = "source" if source else str(split)
     _write_json(reports / f"{report_stem}_predict_scores.json", summary)
@@ -1438,7 +1451,8 @@ def export_from_runtime_config(config: dict[str, Any]) -> AnomalyExportResult:
     cfg = _build_cfg(config, action="export")
     if str(cfg["export"]["format"]).lower() != "onnx":
         raise ValueError("Active forge anomaly export currently supports format=onnx only")
-    device = _resolve_device(cfg["train"]["device"])
+    runtime = setup_runtime(device=cfg["train"]["device"], data_cfg={"distributed": cfg.get("distributed", {})})
+    device = runtime.device
     feature_extractor = build_feature_extractor(
         model_name=cfg["model"]["name"],
         checkpoint_path=cfg["model"]["checkpoint"],
@@ -1447,13 +1461,12 @@ def export_from_runtime_config(config: dict[str, Any]) -> AnomalyExportResult:
         image_size=cfg["dataset"]["image_size"],
         device=device,
     )
-    predictor = build_predictor(cfg["model"], feature_extractor).to(device)
+    predictor = runtime.prepare_module(build_predictor(cfg["model"], feature_extractor).eval(), training=False)
     checkpoint_path = _resolve_checkpoint_path(cfg, "export")
     checkpoint = load_checkpoint(checkpoint_path)
     predictor.load_state_dict(_predictor_state_dict_from_checkpoint(checkpoint, checkpoint_path))
     predictor.eval()
-    wrapper = _InferenceWrapper(feature_extractor, predictor, cfg["model"]).to(device)
-    wrapper.eval()
+    wrapper = runtime.prepare_module(_InferenceWrapper(feature_extractor, predictor, cfg["model"]).eval(), training=False)
     output_path = Path(cfg["export"]["output_path"])
     if not output_path.is_absolute():
         output_path = (_repo_root() / output_path).resolve()

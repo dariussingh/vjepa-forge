@@ -1,4 +1,5 @@
 task: classify
+mode: train
 media: image
 references:
   backbone: [vjepa, vjepa2, vjepa2_1]
@@ -40,6 +41,10 @@ distributed:
   gradient_accumulation: 1
   sync_batchnorm: false
   compile: false
+  compile_mode: reduce-overhead
+  tf32: true
+  channels_last: false
+  ddp_eval: false
 export:
   format: onnx
   opset: 17

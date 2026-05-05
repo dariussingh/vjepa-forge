@@ -23,6 +23,7 @@ from vjepa_forge.engine.optimization import (
     normalize_stages,
     update_early_stopping,
 )
+from vjepa_forge.engine.runtime import broadcast_object, distributed_sampler, setup_runtime
 from vjepa_forge.losses.classification import classification_loss
 
 try:
@@ -68,7 +69,8 @@ class BaseTrainer:
         self.epochs = epochs
         self.batch_size = batch_size
         self.num_workers = num_workers
-        self.device = torch.device(device)
+        self.runtime = setup_runtime(device=device, data_cfg=getattr(self.model, "data_cfg", {}))
+        self.device = self.runtime.device
         self.split = split if split is not None else getattr(self, "split", None)
         self.save = bool(save)
         self.save_period = int(save_period)
@@ -124,6 +126,15 @@ class BaseTrainer:
             "collate_fn": collator.collate,
             "pin_memory": pin_memory,
         }
+        sampler = None
+        if split == "train" and self.runtime.distributed:
+            sampler = distributed_sampler(dataset, shuffle=True)
+        elif split != "train" and self.runtime.distributed and self.runtime.config.ddp_eval:
+            sampler = distributed_sampler(dataset, shuffle=False)
+        if sampler is not None:
+            loader_kwargs["sampler"] = sampler
+        else:
+            loader_kwargs["shuffle"] = split == "train"
         if worker_count > 0:
             loader_kwargs["persistent_workers"] = persistent_workers
             if prefetch_factor is not None:
@@ -131,9 +142,17 @@ class BaseTrainer:
         return DataLoader(dataset, **loader_kwargs)
 
     def progress(self, iterable, *, desc: str, total: int | None = None):
-        if tqdm is None:
+        if tqdm is None or not self.runtime.is_primary:
             return iterable
         return tqdm(iterable, desc=desc, total=total, dynamic_ncols=True)
+
+    def move_batch_to_device(self, batch: ForgeBatch) -> ForgeBatch:
+        batch.x = self.runtime.move_tensor(batch.x)
+        return batch
+
+    def forward_pass(self, model, batch: ForgeBatch):
+        with self.runtime.autocast_context():
+            return model(batch)
 
     def compute_loss(self, batch: ForgeBatch, outputs) -> torch.Tensor:
         if batch.task == "classify":
@@ -212,6 +231,8 @@ class BaseTrainer:
         return str(value)
 
     def _emit_epoch_summary(self, *, epoch: int, train_loss: float, val_loss: float | None, val_metrics: dict[str, Any] | None) -> None:
+        if not self.runtime.is_primary:
+            return
         parts = [f"epoch={epoch}", f"train_loss={train_loss:.4f}"]
         if val_loss is not None:
             parts.append(f"val_loss={val_loss:.4f}")
@@ -225,6 +246,31 @@ class BaseTrainer:
 
     def validate_epoch(self):
         from vjepa_forge.tasks import TASK_REGISTRY
+        from vjepa_forge.engine.validator import ValidationResult
+
+        if self.runtime.distributed and not self.runtime.config.ddp_eval:
+            payload = None
+            if self.runtime.is_primary:
+                try:
+                    validator = TASK_REGISTRY[str(getattr(self.model, "task", "classify"))]["val"](self.model, **self._validator_kwargs())
+                except (FileNotFoundError, KeyError) as exc:
+                    logger.warning("Skipping validation split due to missing validation data: %s", exc)
+                else:
+                    try:
+                        result = validator.run()
+                    except (FileNotFoundError, KeyError) as exc:
+                        logger.warning("Skipping validation split due to missing validation data: %s", exc)
+                    else:
+                        payload = {
+                            "loss": result.loss,
+                            "batches": result.batches,
+                            "metrics": result.metrics,
+                            "split": result.split,
+                        }
+            payload = broadcast_object(payload, src=0)
+            if payload is None:
+                return None
+            return ValidationResult(**payload)
 
         try:
             validator = TASK_REGISTRY[str(getattr(self.model, "task", "classify"))]["val"](self.model, **self._validator_kwargs())
@@ -295,6 +341,8 @@ class BaseTrainer:
         checkpoint_kind: str,
         target_path: Path,
     ) -> None:
+        if not self.runtime.is_primary:
+            return
         metrics = {
             "train_loss": train_loss,
             "val_loss": val_loss,
@@ -323,7 +371,10 @@ class BaseTrainer:
         save_checkpoint(payload, target_path)
 
     def run(self) -> TrainResult:
-        self.model.to(self.device)
+        if self.device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
+        self.model = self.model.to(self.device)
+        train_model = self.runtime.prepare_module(self.model, training=True)
         loader = self.build_loader(split="train")
         train_settings = build_train_settings(self.model.data_cfg, epochs=self.epochs, batch_size=self.batch_size)
         stages = normalize_stages(task=str(getattr(self.model, "task", "classify")), model=self.model, train_cfg=train_settings, default_epochs=self.epochs, batch_size=self.batch_size)
@@ -345,17 +396,27 @@ class BaseTrainer:
                 running_epoch += 1
                 if running_epoch < start_epoch:
                     continue
+                sampler = getattr(loader, "sampler", None)
+                if sampler is not None and hasattr(sampler, "set_epoch"):
+                    sampler.set_epoch(running_epoch)
                 self.model.train(True)
+                train_model.train(True)
                 epoch_losses: list[float] = []
                 progress = self.progress(loader, desc=f"{stage.name} {running_epoch}/{total_epochs}", total=len(loader))
                 stage_global_step = scheduler.current_step
                 for batch in progress:
-                    batch.x = batch.x.to(self.device)
+                    batch = self.move_batch_to_device(batch)
                     optimizer.zero_grad(set_to_none=True)
-                    outputs = self.model(batch)
-                    loss = self.compute_loss(batch, outputs)
-                    loss.backward()
-                    optimizer.step()
+                    outputs = self.forward_pass(train_model, batch)
+                    with self.runtime.autocast_context():
+                        loss = self.compute_loss(batch, outputs)
+                    if self.runtime.scaler is not None:
+                        self.runtime.scaler.scale(loss).backward()
+                        self.runtime.scaler.step(optimizer)
+                        self.runtime.scaler.update()
+                    else:
+                        loss.backward()
+                        optimizer.step()
                     current_lr = scheduler.step(stage_global_step)
                     stage_global_step += 1
                     last_loss = float(loss.detach().cpu().item())
@@ -387,7 +448,8 @@ class BaseTrainer:
                 rows.append(row)
                 rows = self._normalized_results_rows(rows)
                 self._emit_epoch_summary(epoch=running_epoch, train_loss=train_loss, val_loss=val_loss, val_metrics=(val_metrics or {}) | {"monitor": monitor_value})
-                write_results_csv(self.paths.results_csv, rows)
+                if self.runtime.is_primary:
+                    write_results_csv(self.paths.results_csv, rows)
                 improved = is_improvement(monitor_value, stage_stop.best, stage.monitor, min_delta=stage.early_stopping.min_delta)
                 stage_stop = update_early_stopping(stage_stop, value=monitor_value, stage=stage, completed_stage_epochs=_local_epoch + 1)
                 if improved:

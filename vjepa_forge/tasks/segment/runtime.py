@@ -31,19 +31,22 @@ class SegmentTrainer(BaseTrainer):
 
 class SegmentValidator(BaseTrainer):
     def run(self) -> ValidationResult:
-        self.model.to(self.device)
+        if self.device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
+        self.model = self.model.to(self.device)
         self.model.eval()
         split = str(getattr(self, "split", "val"))
         loader = self.build_loader(split=split)
         total = 0.0
         batches = 0
         metric_values: list[float] = []
-        with torch.no_grad():
+        with self.runtime.inference_context():
             progress = _progress(loader, desc=f"{split}", total=len(loader))
             for batch in progress:
-                batch.x = batch.x.to(self.device)
-                outputs = self.model(batch)
-                loss, _ = self.model.head.compute_segmentation_loss(outputs, batch.labels)
+                batch = self.move_batch_to_device(batch)
+                outputs = self.forward_pass(self.model, batch)
+                with self.runtime.autocast_context():
+                    loss, _ = self.model.head.compute_segmentation_loss(outputs, batch.labels)
                 total += float(loss.detach().cpu().item())
                 batches += 1
                 if self.model.head.strategy == "ultralytics":
@@ -78,15 +81,17 @@ class SegmentValidator(BaseTrainer):
 
 class SegmentPredictor(BaseTrainer):
     def run(self) -> PredictResult:
-        self.model.to(self.device)
+        if self.device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
+        self.model = self.model.to(self.device)
         self.model.eval()
         split = str(getattr(self, "split", "val"))
         loader = self.build_loader(split=split)
         results: list[Any] = []
-        with torch.no_grad():
+        with self.runtime.inference_context():
             progress = _progress(loader, desc=f"predict:{split}", total=len(loader))
             for batch in progress:
-                batch.x = batch.x.to(self.device)
-                outputs = self.model(batch)
+                batch = self.move_batch_to_device(batch)
+                outputs = self.forward_pass(self.model, batch)
                 results.append(self.model.head.decode_predictions(outputs))
         return PredictResult(outputs=results, summary={"batches": len(results)}, split=split)

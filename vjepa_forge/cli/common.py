@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from typing import Any
 
-from vjepa_forge.configs.loader import load_config, parse_override_value
+from vjepa_forge.cfg.loader import load_recipe_config, parse_override_value
 
 
 def parse_kv_pairs(items: list[str]) -> dict[str, Any]:
@@ -26,7 +26,7 @@ def parse_config_args(description: str) -> tuple[argparse.ArgumentParser, argpar
         config_path = overrides.pop("recipe", None)
     if not config_path:
         raise SystemExit("Pass config=<path-to-yaml>")
-    config = load_config(config_path, overrides=overrides)
+    config = load_recipe_config(config_path, overrides=overrides)
     return parser, args, config
 
 
