@@ -17,16 +17,23 @@ dataset:
   future_frames: 8
   stride: 1
 model:
+  arch: vjepa_native
   name: vjepa2_1_vit_base_384
   checkpoint: weights/vjepa2_1_vitb_dist_vitG_384.pt
   checkpoint_key: ema_encoder
-  hidden_dim: 1024
-  dropout: 0.1
+  predictor_checkpoint_key: predictor
+  predictor_type: vjepa_native
+  loss:
+    loss_exp: 1.0
 train:
   batch_size: 4
   epochs: 1
-  lr: 0.0001
-  weight_decay: 0.0001
+  lr: 0.0006
+  start_lr: 0.0001
+  final_lr: 0.0006
+  weight_decay: 0.04
+  final_weight_decay: 0.04
+  warmup: 40
   num_workers: 0
   device: cpu
 eval:

@@ -11,7 +11,7 @@ from vjepa_forge.data.batching import ForgeBatch
 from vjepa_forge.engine.checkpointing import load_checkpoint
 from vjepa_forge.engine.model import ForgeModel
 from vjepa_forge.engine.trainer import BaseTrainer
-from vjepa_forge.heads.anomaly.modeling import ExtractedFeatures
+from vjepa_forge.heads.anomaly.modeling import NativeExtractedFeatures
 import vjepa_forge.tasks.anomaly.runtime as anomaly_runtime_mod
 import vjepa_forge.tasks.anomaly.predict as anomaly_predict_mod
 import vjepa_forge.tasks.anomaly.val as anomaly_val_mod
@@ -298,6 +298,69 @@ def _write_video(path: Path, *, frames: int = 6, size: int = 32) -> None:
         writer.release()
 
 
+class _FakeNativeExtractor(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.tubelet_size = 1
+
+    def forward(self, clip: torch.Tensor) -> NativeExtractedFeatures:
+        batch, _, frames, _, _ = clip.shape
+        half = frames // 2
+        pooled = clip.mean(dim=(3, 4)).permute(0, 2, 1)
+        context = pooled[:, :half, :]
+        target = pooled[:, half:, :]
+        return NativeExtractedFeatures(context_tokens=context, target_tokens=target)
+
+
+class _FakeNativePredictor(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.predictor = torch.nn.Linear(3, 3, bias=False)
+        with torch.no_grad():
+            self.predictor.weight.copy_(torch.eye(3))
+
+    def forward(self, context_tokens: torch.Tensor) -> torch.Tensor:
+        return self.predictor(context_tokens).unsqueeze(2)
+
+    def project_targets(self, target_tokens: torch.Tensor) -> torch.Tensor:
+        return target_tokens.unsqueeze(2)
+
+
+def _patch_native_components(monkeypatch, predictor: torch.nn.Module | None = None) -> torch.nn.Module:
+    native_predictor = predictor or _FakeNativePredictor()
+    monkeypatch.setattr(
+        anomaly_runtime_mod,
+        "_build_components",
+        lambda cfg, device: (_FakeNativeExtractor(), native_predictor),
+    )
+    return native_predictor
+
+
+def _native_runtime_config(
+    tmp_path: Path,
+    dataset_yaml: Path,
+    *,
+    data: dict | None = None,
+    train: dict | None = None,
+    val: dict | None = None,
+    predict: dict | None = None,
+) -> dict:
+    return {
+        "model": {
+            "arch": "vjepa_native",
+            "name": "vjepa2_1_vit_base_384",
+            "backbone": {"checkpoint": "dummy.pt", "checkpoint_key": "ema_encoder"},
+            "predictor_type": "vjepa_native",
+        },
+        "data": {"_path": str(dataset_yaml), "image_size": 32, "past_frames": 2, "future_frames": 2, "stride": 1, **(data or {})},
+        "train": {"device": "cpu", "project": str(tmp_path / "runs"), "name": "anomaly-exp", "exist_ok": True, **(train or {})},
+        "val": {"batch_size": 1, "num_workers": 0, **(val or {})},
+        "predict": {**(predict or {})},
+        "export": {},
+        "output": {},
+    }
+
+
 def test_anomaly_val_and_predict_return_metric_summaries(tmp_path: Path, monkeypatch):
     dataset_yaml = _write_anomaly_dataset(tmp_path / "anomaly")
     model = ForgeModel(
@@ -336,45 +399,12 @@ def test_anomaly_val_and_predict_return_metric_summaries(tmp_path: Path, monkeyp
 
 def test_anomaly_runtime_saves_and_resumes_unified_checkpoints(tmp_path: Path, monkeypatch):
     dataset_yaml = _write_anomaly_dataset(tmp_path / "anomaly_resume")
-
-    class _FakeExtractor(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.tubelet_size = 1
-            self.embed_dim = 3
-            self.grid_depth = 2
-            self.grid_size = 1
-
-        def forward(self, clip: torch.Tensor) -> ExtractedFeatures:
-            pooled = clip.mean(dim=(2, 3, 4))
-            tokens = pooled.unsqueeze(1).unsqueeze(2).repeat(1, clip.shape[2], 1, 1)
-            return ExtractedFeatures(pooled=pooled, tokens=tokens)
-
-    monkeypatch.setattr(
-        anomaly_runtime_mod,
-        "build_feature_extractor",
-        lambda **kwargs: _FakeExtractor(),
+    _patch_native_components(monkeypatch)
+    base_config = _native_runtime_config(
+        tmp_path,
+        dataset_yaml,
+        train={"epochs": 1, "batch_size": 1, "num_workers": 0},
     )
-    monkeypatch.setattr(
-        anomaly_runtime_mod,
-        "build_predictor",
-        lambda model_cfg, feature_extractor: torch.nn.Linear(feature_extractor.embed_dim, feature_extractor.embed_dim, bias=False),
-    )
-    base_config = {
-        "model": {
-            "name": "vjepa2_1_vit_base_384",
-            "backbone": {"checkpoint": "dummy.pt", "checkpoint_key": "ema_encoder"},
-            "predictor_type": "global_mlp",
-            "hidden_dim": 4,
-            "dropout": 0.0,
-        },
-        "data": {"_path": str(dataset_yaml), "image_size": 32, "past_frames": 2, "future_frames": 2, "stride": 1},
-        "train": {"epochs": 1, "batch_size": 1, "num_workers": 0, "device": "cpu", "project": str(tmp_path / "runs"), "name": "anomaly-exp", "exist_ok": True},
-        "val": {"batch_size": 1, "num_workers": 0},
-        "predict": {},
-        "export": {},
-        "output": {},
-    }
     first = anomaly_runtime_mod.train_from_runtime_config(base_config)
     assert Path(first.best_checkpoint).exists()
     assert Path(first.last_checkpoint).exists()
@@ -398,73 +428,26 @@ def test_anomaly_runtime_saves_and_resumes_unified_checkpoints(tmp_path: Path, m
 
 def test_anomaly_runtime_accepts_legacy_predictor_state_checkpoints(tmp_path: Path, monkeypatch):
     dataset_yaml = _write_anomaly_dataset(tmp_path / "anomaly_legacy")
-
-    class _FakeExtractor(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.tubelet_size = 1
-            self.embed_dim = 3
-            self.grid_depth = 2
-            self.grid_size = 1
-
-        def forward(self, clip: torch.Tensor) -> ExtractedFeatures:
-            pooled = clip.mean(dim=(2, 3, 4))
-            tokens = pooled.unsqueeze(1).unsqueeze(2).repeat(1, clip.shape[2], 1, 1)
-            return ExtractedFeatures(pooled=pooled, tokens=tokens)
-
-    monkeypatch.setattr(anomaly_runtime_mod, "build_feature_extractor", lambda **kwargs: _FakeExtractor())
-    monkeypatch.setattr(
-        anomaly_runtime_mod,
-        "build_predictor",
-        lambda model_cfg, feature_extractor: torch.nn.Linear(feature_extractor.embed_dim, feature_extractor.embed_dim, bias=False),
-    )
-    predictor = torch.nn.Linear(3, 3, bias=False)
+    predictor = _patch_native_components(monkeypatch)
     ckpt = tmp_path / "legacy_predictor.pt"
-    torch.save({"predictor_state": predictor.state_dict()}, ckpt)
+    torch.save({"predictor_state": predictor.predictor.state_dict()}, ckpt)
     result = anomaly_runtime_mod.predict_from_runtime_config(
-        {
-            "model": {
-                "name": "vjepa2_1_vit_base_384",
-                "backbone": {"checkpoint": "dummy.pt", "checkpoint_key": "ema_encoder"},
-                "predictor_type": "global_mlp",
-                "hidden_dim": 4,
-                "dropout": 0.0,
-            },
-            "data": {"_path": str(dataset_yaml), "image_size": 32, "past_frames": 2, "future_frames": 2, "stride": 1},
-            "train": {"device": "cpu", "project": str(tmp_path / "runs"), "name": "legacy-ckpt", "exist_ok": True},
-            "val": {"batch_size": 1, "num_workers": 0, "checkpoint_path": str(ckpt)},
-            "predict": {"split": "test", "batch_size": 1, "num_workers": 0},
-            "export": {},
-            "output": {},
-        }
+        _native_runtime_config(
+            tmp_path,
+            dataset_yaml,
+            train={"name": "legacy-ckpt"},
+            val={"checkpoint_path": str(ckpt), "predictor_source": "anomaly_checkpoint"},
+            predict={"split": "test", "batch_size": 1, "num_workers": 0},
+        )
     )
     assert result.metrics["predictor_frame_auc"] is not None
 
 
 def test_anomaly_eval_uses_validation_split_for_threshold_calibration(tmp_path: Path, monkeypatch):
     dataset_yaml = _write_anomaly_dataset(tmp_path / "anomaly_eval")
-
-    class _FakeExtractor(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.tubelet_size = 1
-            self.embed_dim = 3
-            self.grid_depth = 2
-            self.grid_size = 1
-
-        def forward(self, clip: torch.Tensor) -> ExtractedFeatures:
-            pooled = clip.mean(dim=(2, 3, 4))
-            tokens = pooled.unsqueeze(1).unsqueeze(2).repeat(1, clip.shape[2], 1, 1)
-            return ExtractedFeatures(pooled=pooled, tokens=tokens)
-
-    monkeypatch.setattr(anomaly_runtime_mod, "build_feature_extractor", lambda **kwargs: _FakeExtractor())
-    monkeypatch.setattr(
-        anomaly_runtime_mod,
-        "build_predictor",
-        lambda model_cfg, feature_extractor: torch.nn.Linear(feature_extractor.embed_dim, feature_extractor.embed_dim, bias=False),
-    )
+    _patch_native_components(monkeypatch)
     monkeypatch.setattr(anomaly_runtime_mod, "_make_loaders", lambda cfg, include_test=True: {"val_loader": "val", "test_loader": "test"})
-    monkeypatch.setattr(anomaly_runtime_mod, "load_checkpoint", lambda path: {"model_state": torch.nn.Linear(3, 3, bias=False).state_dict()})
+    monkeypatch.setattr(anomaly_runtime_mod, "load_checkpoint", lambda path: {"model_state": _FakeNativePredictor().predictor.state_dict()})
     monkeypatch.setattr(anomaly_runtime_mod, "_make_output_root", lambda cfg: tmp_path / "runs" / "eval-threshold")
 
     def _summary(normal_score: float, anomaly_score: float) -> dict[str, object]:
@@ -485,28 +468,19 @@ def test_anomaly_eval_uses_validation_split_for_threshold_calibration(tmp_path: 
             }
         }
 
-    def _fake_aggregate_scores(loader, predictor, feature_extractor, device, desc, model_cfg):
+    def _fake_aggregate_scores(loader, predictor, feature_extractor, runtime, desc, model_cfg):
         if loader == "val":
             return _summary(0.2, 0.8), {"avg_decode_time": 0.0, "avg_model_time": 0.0}
         return _summary(0.6, 0.7), {"avg_decode_time": 0.0, "avg_model_time": 0.0}
 
     monkeypatch.setattr(anomaly_runtime_mod, "_aggregate_scores", _fake_aggregate_scores)
     result = anomaly_runtime_mod.validate_from_runtime_config(
-        {
-            "model": {
-                "name": "vjepa2_1_vit_base_384",
-                "backbone": {"checkpoint": "dummy.pt", "checkpoint_key": "ema_encoder"},
-                "predictor_type": "global_mlp",
-                "hidden_dim": 4,
-                "dropout": 0.0,
-            },
-            "data": {"_path": str(dataset_yaml), "image_size": 32, "past_frames": 2, "future_frames": 2, "stride": 1},
-            "train": {"device": "cpu", "project": str(tmp_path / "runs"), "name": "eval-threshold", "exist_ok": True},
-            "val": {"split": "test", "batch_size": 1, "num_workers": 0, "checkpoint_path": "dummy.pt", "threshold_std_multiplier": 0.0},
-            "predict": {},
-            "export": {},
-            "output": {},
-        }
+        _native_runtime_config(
+            tmp_path,
+            dataset_yaml,
+            train={"name": "eval-threshold"},
+            val={"split": "test", "batch_size": 1, "num_workers": 0, "checkpoint_path": "dummy.pt", "predictor_source": "anomaly_checkpoint", "threshold_std_multiplier": 0.0},
+        )
     )
     assert result.metrics["predictor_threshold"] == pytest.approx(0.2)
     assert result.metrics["predictor_val_false_positive_rate"] == 0.0
@@ -548,45 +522,17 @@ def test_anomaly_clip_metrics_include_confusion_matrix():
 
 def test_anomaly_predict_returns_thresholded_clip_summaries(tmp_path: Path, monkeypatch):
     dataset_yaml = _write_anomaly_dataset(tmp_path / "anomaly_predict")
-
-    class _FakeExtractor(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.tubelet_size = 1
-            self.embed_dim = 3
-            self.grid_depth = 2
-            self.grid_size = 1
-
-        def forward(self, clip: torch.Tensor) -> ExtractedFeatures:
-            pooled = clip.mean(dim=(2, 3, 4))
-            tokens = pooled.unsqueeze(1).unsqueeze(2).repeat(1, clip.shape[2], 1, 1)
-            return ExtractedFeatures(pooled=pooled, tokens=tokens)
-
-    monkeypatch.setattr(anomaly_runtime_mod, "build_feature_extractor", lambda **kwargs: _FakeExtractor())
-    monkeypatch.setattr(
-        anomaly_runtime_mod,
-        "build_predictor",
-        lambda model_cfg, feature_extractor: torch.nn.Linear(feature_extractor.embed_dim, feature_extractor.embed_dim, bias=False),
-    )
-    predictor = torch.nn.Linear(3, 3, bias=False)
+    predictor = _patch_native_components(monkeypatch)
     ckpt = tmp_path / "predictor.pt"
-    torch.save({"model_state": predictor.state_dict()}, ckpt)
+    torch.save({"model_state": predictor.predictor.state_dict()}, ckpt)
     result = anomaly_runtime_mod.predict_from_runtime_config(
-        {
-            "model": {
-                "name": "vjepa2_1_vit_base_384",
-                "backbone": {"checkpoint": "dummy.pt", "checkpoint_key": "ema_encoder"},
-                "predictor_type": "global_mlp",
-                "hidden_dim": 4,
-                "dropout": 0.0,
-            },
-            "data": {"_path": str(dataset_yaml), "image_size": 32, "past_frames": 2, "future_frames": 2, "stride": 1},
-            "train": {"device": "cpu", "project": str(tmp_path / "runs"), "name": "predict-threshold", "exist_ok": True},
-            "val": {"batch_size": 1, "num_workers": 0, "checkpoint_path": str(ckpt)},
-            "predict": {"split": "test", "batch_size": 1, "num_workers": 0, "threshold": 0.1},
-            "export": {},
-            "output": {},
-        }
+        _native_runtime_config(
+            tmp_path,
+            dataset_yaml,
+            train={"name": "predict-threshold"},
+            val={"checkpoint_path": str(ckpt), "predictor_source": "anomaly_checkpoint"},
+            predict={"split": "test", "batch_size": 1, "num_workers": 0, "threshold": 0.1},
+        )
     )
     assert result.metrics["predictor_thresholded"]["threshold"] == 0.1
     assert len(result.metrics["predictor_thresholded"]["clips"]) == 2
@@ -595,46 +541,19 @@ def test_anomaly_predict_returns_thresholded_clip_summaries(tmp_path: Path, monk
 def test_anomaly_predict_visualize_requires_threshold(tmp_path: Path, monkeypatch):
     source = tmp_path / "single.mp4"
     _write_video(source)
-
-    class _FakeExtractor(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.tubelet_size = 1
-            self.embed_dim = 3
-            self.grid_depth = 2
-            self.grid_size = 1
-
-        def forward(self, clip: torch.Tensor) -> ExtractedFeatures:
-            pooled = clip.mean(dim=(2, 3, 4))
-            tokens = pooled.unsqueeze(1).unsqueeze(2).repeat(1, clip.shape[2], 1, 1)
-            return ExtractedFeatures(pooled=pooled, tokens=tokens)
-
-    monkeypatch.setattr(anomaly_runtime_mod, "build_feature_extractor", lambda **kwargs: _FakeExtractor())
-    monkeypatch.setattr(
-        anomaly_runtime_mod,
-        "build_predictor",
-        lambda model_cfg, feature_extractor: torch.nn.Linear(feature_extractor.embed_dim, feature_extractor.embed_dim, bias=False),
-    )
-    predictor = torch.nn.Linear(3, 3, bias=False)
+    predictor = _patch_native_components(monkeypatch)
     ckpt = tmp_path / "predictor_source.pt"
-    torch.save({"model_state": predictor.state_dict()}, ckpt)
+    torch.save({"model_state": predictor.predictor.state_dict()}, ckpt)
     try:
         anomaly_runtime_mod.predict_from_runtime_config(
-            {
-                "model": {
-                    "name": "vjepa2_1_vit_base_384",
-                    "backbone": {"checkpoint": "dummy.pt", "checkpoint_key": "ema_encoder"},
-                    "predictor_type": "global_mlp",
-                    "hidden_dim": 4,
-                    "dropout": 0.0,
-                },
-                "data": {"image_size": 32, "past_frames": 2, "future_frames": 2, "stride": 1, "video_backend": "decord"},
-                "train": {"device": "cpu", "project": str(tmp_path / "runs"), "name": "predict-source", "exist_ok": True},
-                "val": {"batch_size": 1, "num_workers": 0, "checkpoint_path": str(ckpt)},
-                "predict": {"source": str(source), "batch_size": 1, "num_workers": 0, "visualize": True},
-                "export": {},
-                "output": {},
-            }
+            _native_runtime_config(
+                tmp_path,
+                dataset_yaml=tmp_path / "unused.yaml",
+                data={"video_backend": "decord"},
+                train={"name": "predict-source"},
+                val={"checkpoint_path": str(ckpt), "predictor_source": "anomaly_checkpoint"},
+                predict={"source": str(source), "batch_size": 1, "num_workers": 0, "visualize": True},
+            )
         )
     except ValueError as exc:
         assert "predict.threshold" in str(exc)
@@ -645,42 +564,17 @@ def test_anomaly_predict_visualize_requires_threshold(tmp_path: Path, monkeypatc
 def test_anomaly_predict_standalone_source_writes_visualized_mp4(tmp_path: Path, monkeypatch):
     source = tmp_path / "single_vis.mp4"
     _write_video(source, frames=8)
-
-    class _FakeExtractor(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.tubelet_size = 1
-            self.embed_dim = 3
-            self.grid_depth = 2
-            self.grid_size = 1
-
-        def forward(self, clip: torch.Tensor) -> ExtractedFeatures:
-            pooled = clip.mean(dim=(2, 3, 4))
-            tokens = pooled.unsqueeze(1).unsqueeze(2).repeat(1, clip.shape[2], 1, 1)
-            return ExtractedFeatures(pooled=pooled, tokens=tokens)
-
-    monkeypatch.setattr(anomaly_runtime_mod, "build_feature_extractor", lambda **kwargs: _FakeExtractor())
-    monkeypatch.setattr(
-        anomaly_runtime_mod,
-        "build_predictor",
-        lambda model_cfg, feature_extractor: torch.nn.Linear(feature_extractor.embed_dim, feature_extractor.embed_dim, bias=False),
-    )
-    predictor = torch.nn.Linear(3, 3, bias=False)
+    predictor = _patch_native_components(monkeypatch)
     ckpt = tmp_path / "predictor_source_vis.pt"
-    torch.save({"model_state": predictor.state_dict()}, ckpt)
+    torch.save({"model_state": predictor.predictor.state_dict()}, ckpt)
     result = anomaly_runtime_mod.predict_from_runtime_config(
-        {
-            "model": {
-                "name": "vjepa2_1_vit_base_384",
-                "backbone": {"checkpoint": "dummy.pt", "checkpoint_key": "ema_encoder"},
-                "predictor_type": "global_mlp",
-                "hidden_dim": 4,
-                "dropout": 0.0,
-            },
-            "data": {"image_size": 32, "past_frames": 2, "future_frames": 2, "stride": 1, "video_backend": "decord"},
-            "train": {"device": "cpu", "project": str(tmp_path / "runs"), "name": "predict-source-vis", "exist_ok": True},
-            "val": {"batch_size": 1, "num_workers": 0, "checkpoint_path": str(ckpt)},
-            "predict": {
+        _native_runtime_config(
+            tmp_path,
+            dataset_yaml=tmp_path / "unused.yaml",
+            data={"video_backend": "decord"},
+            train={"name": "predict-source-vis"},
+            val={"checkpoint_path": str(ckpt), "predictor_source": "anomaly_checkpoint"},
+            predict={
                 "source": str(source),
                 "batch_size": 1,
                 "num_workers": 0,
@@ -688,12 +582,100 @@ def test_anomaly_predict_standalone_source_writes_visualized_mp4(tmp_path: Path,
                 "visualize": True,
                 "output_dir": str(tmp_path / "viz"),
             },
-            "export": {},
-            "output": {},
-        }
+        )
     )
     assert result.rendered_outputs is not None
     assert len(result.rendered_outputs) == 1
     rendered = Path(result.rendered_outputs[0])
     assert rendered.exists()
     assert rendered.stat().st_size > 0
+
+
+def test_native_anomaly_predictor_source_defaults_to_pretrained_when_no_anomaly_checkpoint(tmp_path: Path):
+    cfg = {
+        "model": {"arch": "vjepa_native", "predictor_type": "vjepa_native"},
+        "eval": {"predictor_source": "auto", "checkpoint_path": None},
+        "output": {"root": str(tmp_path / "runs")},
+        "dataset": {"dataset_yaml": str(tmp_path / "dummy.yaml")},
+        "train": {"project": str(tmp_path / "runs"), "name": "native-source", "exist_ok": True, "resume": False},
+    }
+    assert anomaly_runtime_mod._resolve_predictor_source(cfg, "eval") == "pretrained_vjepa"
+
+
+def test_anomaly_runtime_rejects_removed_predictor_types(tmp_path: Path):
+    dataset_yaml = _write_anomaly_dataset(tmp_path / "anomaly_removed_predictor")
+    config = _native_runtime_config(tmp_path, dataset_yaml)
+    config["model"]["predictor_type"] = "global_mlp"
+    with pytest.raises(ValueError, match="Legacy predictors were removed"):
+        anomaly_runtime_mod._build_cfg(config, action="train")
+
+
+@pytest.mark.parametrize("model_name", ["vjepa2_1_vit_base_384", "vjepa2_1_vit_large_384"])
+def test_native_anomaly_validation_uses_pretrained_predictor_without_checkpoint(tmp_path: Path, monkeypatch, model_name: str):
+    dataset_yaml = _write_anomaly_dataset(tmp_path / "anomaly_native_eval")
+
+    class _NativeExtractor(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.tubelet_size = 1
+
+        def forward(self, clip: torch.Tensor) -> NativeExtractedFeatures:
+            batch, _, frames, _, _ = clip.shape
+            context = torch.zeros(batch, frames // 2, 1, 3, device=clip.device)
+            target = torch.ones(batch, frames // 2, 1, 3, device=clip.device)
+            return NativeExtractedFeatures(context_tokens=context.reshape(batch, -1, 3), target_tokens=target.reshape(batch, -1, 3))
+
+    class _NativePredictor(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.predictor = torch.nn.Linear(3, 3, bias=False)
+
+        def forward(self, context_tokens: torch.Tensor) -> torch.Tensor:
+            projected = self.predictor(context_tokens)
+            return projected.unsqueeze(2)
+
+        def project_targets(self, target_tokens: torch.Tensor) -> torch.Tensor:
+            projected = target_tokens + 0.5
+            return projected.unsqueeze(2)
+
+    predictor = _NativePredictor()
+    monkeypatch.setattr(anomaly_runtime_mod, "_build_components", lambda cfg, device: (_NativeExtractor(), predictor))
+    monkeypatch.setattr(anomaly_runtime_mod, "_make_loaders", lambda cfg, include_test=True, **kwargs: {"val_loader": "val", "test_loader": "test"})
+    monkeypatch.setattr(anomaly_runtime_mod, "_make_output_root", lambda cfg: tmp_path / "runs" / "native-pretrained")
+
+    def _summary() -> dict[str, object]:
+        return {
+            "videos": {
+                "normal": {"frame_ids": [0], "predictor_scores": [0.2], "frozen_scores": [0.1], "labels": [0]},
+                "anomaly": {"frame_ids": [0], "predictor_scores": [0.9], "frozen_scores": [0.8], "labels": [1]},
+            }
+        }
+
+    monkeypatch.setattr(
+        anomaly_runtime_mod,
+        "_aggregate_scores",
+        lambda *args, **kwargs: (_summary(), {"avg_decode_time": 0.0, "avg_model_time": 0.0}),
+    )
+
+    def _fail_load_checkpoint(path):
+        raise AssertionError(f"load_checkpoint should not be called for pretrained native validation: {path}")
+
+    monkeypatch.setattr(anomaly_runtime_mod, "load_checkpoint", _fail_load_checkpoint)
+    result = anomaly_runtime_mod.validate_from_runtime_config(
+        {
+            "model": {
+                "arch": "vjepa_native",
+                "name": model_name,
+                "backbone": {"checkpoint": "dummy.pt", "checkpoint_key": "ema_encoder"},
+                "predictor_type": "vjepa_native",
+            },
+            "data": {"_path": str(dataset_yaml), "image_size": 32, "past_frames": 2, "future_frames": 2, "stride": 1},
+            "train": {"device": "cpu", "project": str(tmp_path / "runs"), "name": "native-pretrained", "exist_ok": True},
+            "val": {"split": "val", "batch_size": 1, "num_workers": 0, "predictor_source": "auto"},
+            "predict": {},
+            "export": {},
+            "output": {},
+        }
+    )
+    assert result.metrics["checkpoint_path"] is None
+    assert result.metrics["predictor_frame_auc"] == pytest.approx(1.0)

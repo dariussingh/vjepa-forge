@@ -16,7 +16,7 @@ from vjepa_forge.data.video import read_video_frames_uint8
 from vjepa_forge.engine.checkpointing import checkpoint_paths, checkpoint_payload, load_checkpoint, resolve_resume_path, results_csv_rows, save_checkpoint, write_results_csv
 from vjepa_forge.engine.optimization import build_scheduler, build_train_settings, normalize_stages, resolve_autoscaled_lr
 from vjepa_forge.engine.runtime import setup_runtime
-from vjepa_forge.heads.anomaly.modeling import ExtractedFeatures, build_feature_extractor, build_predictor
+from vjepa_forge.heads.anomaly.modeling import NativeExtractedFeatures, build_native_components
 from vjepa_forge.losses.anomaly import anomaly_future_prediction_loss
 from vjepa_forge.metrics.anomaly import roc_auc_score as _roc_auc_score
 from vjepa_forge.tasks.anomaly.data import (
@@ -69,6 +69,15 @@ def _build_cfg(config: dict[str, Any], *, action: str) -> dict[str, Any]:
     if "name" not in model_cfg and "name_full" in model_cfg:
         model_cfg["name"] = model_cfg["name_full"]
     backbone_cfg = dict(model_cfg.get("backbone", {}))
+    arch = str(model_cfg.get("arch", "vjepa_native"))
+    predictor_type = str(model_cfg.get("predictor_type", "vjepa_native"))
+    if arch != "vjepa_native":
+        raise ValueError(f"Unsupported anomaly arch: {arch}. Only 'vjepa_native' is supported.")
+    if predictor_type != "vjepa_native":
+        raise ValueError(
+            f"Unsupported anomaly predictor_type: {predictor_type}. "
+            "Legacy predictors were removed; use 'vjepa_native'."
+        )
     data_cfg = dict(config["data"])
     dataset_yaml = data_cfg.get("_path") or data_cfg.get("dataset_yaml") or data_cfg.get("path")
     source = config.get("predict", {}).get("source")
@@ -76,6 +85,18 @@ def _build_cfg(config: dict[str, Any], *, action: str) -> dict[str, Any]:
         raise ValueError("Anomaly runtime requires data._path or data.dataset_yaml")
     output_root = config.get("output", {}).get("root")
     default_workers = max(1, min(8, os.cpu_count() or 1))
+    train_cfg = dict(config["train"])
+    lr = float(train_cfg.get("lr", 6.0e-4))
+    start_lr = float(train_cfg.get("start_lr", 1.0e-4))
+    final_lr = float(train_cfg.get("final_lr", lr))
+    warmup = float(train_cfg.get("warmup", 40.0))
+    scheduler_defaults = {
+        "type": "constant",
+        "warmup_epochs": warmup,
+        "warmup_start_ratio": start_lr / max(lr, 1.0e-12),
+        "min_lr_ratio": final_lr / max(lr, 1.0e-12),
+    }
+    scheduler_cfg = {**scheduler_defaults, **dict(train_cfg.get("scheduler", {}))}
     return {
         "action": action,
         "dataset": {
@@ -88,18 +109,15 @@ def _build_cfg(config: dict[str, Any], *, action: str) -> dict[str, Any]:
             "train_fraction": float(data_cfg.get("train_fraction", 1.0)),
         },
         "model": {
+            "arch": arch,
             "name": str(model_cfg.get("name", "vjepa2_1_vit_base_384")),
-            "checkpoint": str(backbone_cfg.get("checkpoint")),
-            "checkpoint_key": str(backbone_cfg.get("checkpoint_key", "ema_encoder")),
-            "predictor_type": str(model_cfg.get("predictor_type", "vit_patch")),
-            "hidden_dim": int(model_cfg.get("hidden_dim", 1024)),
-            "dropout": float(model_cfg.get("dropout", 0.1)),
-            "predictor_embed_dim": int(model_cfg.get("predictor_embed_dim", 768)),
-            "predictor_depth": int(model_cfg.get("predictor_depth", 12)),
-            "predictor_num_heads": int(model_cfg.get("predictor_num_heads", 12)),
-            "predictor_use_rope": bool(model_cfg.get("predictor_use_rope", True)),
+            "checkpoint": str(model_cfg.get("checkpoint") or backbone_cfg.get("checkpoint")),
+            "checkpoint_key": str(model_cfg.get("checkpoint_key") or backbone_cfg.get("checkpoint_key", "ema_encoder")),
+            "predictor_checkpoint_key": str(model_cfg.get("predictor_checkpoint_key", "predictor")),
+            "predictor_type": predictor_type,
             "token_aggregation": str(model_cfg.get("token_aggregation", "topk_mean")),
             "token_topk_fraction": float(model_cfg.get("token_topk_fraction", 0.1)),
+            "loss": dict(model_cfg.get("loss", {})),
         },
         "train": {
             "batch_size": int(config["train"].get("batch_size", 1)),
@@ -111,11 +129,15 @@ def _build_cfg(config: dict[str, Any], *, action: str) -> dict[str, Any]:
             "name": config["train"].get("name"),
             "exist_ok": bool(config["train"].get("exist_ok", False)),
             "lr_mode": str(config["train"].get("lr_mode", "manual")),
-            "lr": float(config["train"].get("lr", 1.0e-4)),
+            "lr": lr,
+            "start_lr": start_lr,
+            "final_lr": final_lr,
             "reference_batch_size": int(config["train"].get("reference_batch_size", config["train"].get("batch_size", 1))),
-            "reference_lr": float(config["train"].get("reference_lr", config["train"].get("lr", 1.0e-4))),
+            "reference_lr": float(config["train"].get("reference_lr", lr)),
             "lr_scale_rule": str(config["train"].get("lr_scale_rule", "sqrt")),
-            "weight_decay": float(config["train"].get("weight_decay", 1.0e-4)),
+            "weight_decay": float(config["train"].get("weight_decay", 0.04)),
+            "final_weight_decay": float(config["train"].get("final_weight_decay", 0.04)),
+            "warmup": warmup,
             "num_workers": int(config["train"].get("num_workers", default_workers)),
             "prefetch_factor": int(config["train"].get("prefetch_factor", 2)),
             "persistent_workers": bool(config["train"].get("persistent_workers", True)),
@@ -125,7 +147,7 @@ def _build_cfg(config: dict[str, Any], *, action: str) -> dict[str, Any]:
             "seed": int(config["train"].get("seed", 7)),
             "save_latest_every_epoch": bool(config["train"].get("save_latest_every_epoch", True)),
             "save_epoch_checkpoints": bool(config["train"].get("save_epoch_checkpoints", False)),
-            "scheduler": dict(config["train"].get("scheduler", {})),
+            "scheduler": scheduler_cfg,
             "early_stopping": dict(config["train"].get("early_stopping", {})),
         },
         "eval": {
@@ -139,6 +161,7 @@ def _build_cfg(config: dict[str, Any], *, action: str) -> dict[str, Any]:
             "smoothing_window": int(config["val"].get("smoothing_window", 9)),
             "checkpoint_target": str(config["val"].get("checkpoint_target", "best")),
             "checkpoint_path": config["val"].get("checkpoint_path"),
+            "predictor_source": str(config["val"].get("predictor_source", "auto")),
             "split": str(config["val"].get("split", "val" if action == "val" else "test")),
         },
         "predict": {
@@ -157,20 +180,43 @@ def _build_cfg(config: dict[str, Any], *, action: str) -> dict[str, Any]:
             "dynamic_axes": bool(config["export"].get("dynamic_axes", True)),
             "checkpoint_target": str(config["export"].get("checkpoint_target", config["val"].get("checkpoint_target", "best"))),
             "checkpoint_path": config["export"].get("checkpoint_path"),
+            "predictor_source": str(config["export"].get("predictor_source", config["val"].get("predictor_source", "auto"))),
         },
         "output": {"root": output_root},
         "distributed": dict(config.get("distributed", {})),
     }
 
 
-def _extract_pair_features(feature_extractor: nn.Module, batch: dict[str, Any], runtime) -> tuple[ExtractedFeatures, ExtractedFeatures]:
+def _uses_native_predictor(model_cfg: dict[str, Any]) -> bool:
+    return True
+
+
+def _build_components(cfg: dict[str, Any], device: torch.device) -> tuple[nn.Module, nn.Module]:
+    return build_native_components(
+        model_name=cfg["model"]["name"],
+        checkpoint_path=cfg["model"]["checkpoint"],
+        checkpoint_key=cfg["model"]["checkpoint_key"],
+        predictor_checkpoint_key=cfg["model"]["predictor_checkpoint_key"],
+        past_frames=cfg["dataset"]["past_frames"],
+        future_frames=cfg["dataset"]["future_frames"],
+        image_size=cfg["dataset"]["image_size"],
+        device=device,
+    )
+
+
+def _extract_pair_features(
+    feature_extractor: nn.Module,
+    batch: dict[str, Any],
+    runtime,
+    model_cfg: dict[str, Any],
+) -> tuple[NativeExtractedFeatures, NativeExtractedFeatures]:
     past = runtime.move_tensor(batch["past"])
     future = runtime.move_tensor(batch["future"])
     with torch.no_grad():
         with runtime.autocast_context():
-            past_feat = feature_extractor(past)
-            future_feat = feature_extractor(future)
-    return past_feat, future_feat
+            combined = torch.cat([past, future], dim=2)
+            features = feature_extractor(combined)
+            return features, features
 
 
 def _mse_score(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -191,33 +237,43 @@ def _score_tokens(pred_tokens: torch.Tensor, target_tokens: torch.Tensor, *, tub
     return temporal_scores.repeat_interleave(tubelet_size, dim=1)
 
 
-def _predict_sample_scores(predictor: nn.Module, past_features: ExtractedFeatures, future_features: ExtractedFeatures, model_cfg: dict[str, Any], *, tubelet_size: int) -> tuple[torch.Tensor, torch.Tensor]:
-    predictor_type = model_cfg["predictor_type"]
-    if predictor_type == "global_mlp":
-        pred_future = predictor(past_features.pooled)
-        predictor_scores = _mse_score(pred_future, future_features.pooled)
-        frozen_scores = _mse_score(past_features.pooled, future_features.pooled)
-        frame_count = future_features.tokens.size(1) * tubelet_size
-        return predictor_scores.unsqueeze(1).repeat(1, frame_count), frozen_scores.unsqueeze(1).repeat(1, frame_count)
-    if predictor_type == "vit_patch":
-        pred_tokens = predictor(past_features.tokens)
-        predictor_scores = _score_tokens(
-            pred_tokens,
-            future_features.tokens,
-            tubelet_size=tubelet_size,
-            aggregation=str(model_cfg.get("token_aggregation", "topk_mean")),
-            topk_fraction=float(model_cfg.get("token_topk_fraction", 0.1)),
-        )
-        past_reference = past_features.tokens.mean(dim=1, keepdim=True).expand_as(future_features.tokens)
-        frozen_scores = _score_tokens(
-            past_reference,
-            future_features.tokens,
-            tubelet_size=tubelet_size,
-            aggregation=str(model_cfg.get("token_aggregation", "topk_mean")),
-            topk_fraction=float(model_cfg.get("token_topk_fraction", 0.1)),
-        )
-        return predictor_scores, frozen_scores
-    raise ValueError(f"Unsupported predictor_type: {predictor_type}")
+def _predict_sample_scores(
+    predictor: nn.Module,
+    past_features: NativeExtractedFeatures,
+    future_features: NativeExtractedFeatures,
+    model_cfg: dict[str, Any],
+    *,
+    tubelet_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    pred_tokens = predictor(past_features.context_tokens)
+    target_tokens = predictor.project_targets(past_features.target_tokens)
+    predictor_scores = _score_tokens(
+        pred_tokens,
+        target_tokens,
+        tubelet_size=tubelet_size,
+        aggregation=str(model_cfg.get("token_aggregation", "topk_mean")),
+        topk_fraction=float(model_cfg.get("token_topk_fraction", 0.1)),
+    )
+    context_reference = past_features.context_tokens.view(
+        past_features.context_tokens.size(0),
+        -1,
+        pred_tokens.size(2),
+        past_features.context_tokens.size(-1),
+    ).mean(dim=1, keepdim=True)
+    context_reference = context_reference.expand(-1, pred_tokens.size(1), -1, -1).reshape(
+        past_features.context_tokens.size(0),
+        -1,
+        past_features.context_tokens.size(-1),
+    )
+    frozen_reference = predictor.project_targets(context_reference)
+    frozen_scores = _score_tokens(
+        frozen_reference,
+        target_tokens,
+        tubelet_size=tubelet_size,
+        aggregation=str(model_cfg.get("token_aggregation", "topk_mean")),
+        topk_fraction=float(model_cfg.get("token_topk_fraction", 0.1)),
+    )
+    return predictor_scores, frozen_scores
 
 
 def _aggregate_scores(loader: DataLoader, predictor: nn.Module, feature_extractor: nn.Module, runtime, desc: str, model_cfg: dict[str, Any]) -> tuple[dict[str, Any], dict[str, float]]:
@@ -228,7 +284,7 @@ def _aggregate_scores(loader: DataLoader, predictor: nn.Module, feature_extracto
     for batch in _progress(loader, desc=desc, total=len(loader)):
         decode_times.append(float(batch.get("decode_time", 0.0)))
         model_start = time.perf_counter()
-        past_feat, future_feat = _extract_pair_features(feature_extractor, batch, runtime)
+        past_feat, future_feat = _extract_pair_features(feature_extractor, batch, runtime, model_cfg)
         with runtime.autocast_context():
             predictor_scores_t, frozen_scores_t = _predict_sample_scores(
                 predictor,
@@ -262,7 +318,7 @@ def _aggregate_scores(loader: DataLoader, predictor: nn.Module, feature_extracto
 
 def _checkpoint_payload(predictor: nn.Module, cfg: dict[str, Any], *, epoch: int, train_loss: float, val_loss: float, best_val_loss: float, effective_lr: float, checkpoint_kind: str) -> dict[str, Any]:
     return checkpoint_payload(
-        model_state=predictor.state_dict(),
+        model_state=_predictor_trainable_state_dict(predictor),
         optimizer_state=None,
         scheduler_state=None,
         epoch=epoch,
@@ -287,6 +343,21 @@ def _predictor_state_dict_from_checkpoint(checkpoint: dict[str, Any], checkpoint
     if state_dict is None:
         raise ValueError(f"Checkpoint {checkpoint_path} does not contain predictor weights")
     return state_dict
+
+
+def _predictor_trainable_state_dict(predictor: nn.Module) -> dict[str, Any]:
+    module = getattr(predictor, "module", predictor)
+    if hasattr(module, "predictor"):
+        return module.predictor.state_dict()
+    return module.state_dict()
+
+
+def _load_predictor_state(predictor: nn.Module, state_dict: dict[str, Any]) -> None:
+    module = getattr(predictor, "module", predictor)
+    if hasattr(module, "predictor"):
+        module.predictor.load_state_dict(state_dict)
+        return
+    module.load_state_dict(state_dict)
 
 
 def _resolve_effective_lr(train_cfg: dict[str, Any]) -> tuple[float, dict[str, Any]]:
@@ -327,6 +398,24 @@ def _resolve_checkpoint_path(cfg: dict[str, Any], section: str) -> Path:
     raise ValueError(f"Unsupported checkpoint target: {target}")
 
 
+def _resolve_predictor_source(cfg: dict[str, Any], section: str) -> str:
+    source = str(cfg[section].get("predictor_source", "auto")).lower()
+    if source in {"pretrained_vjepa", "anomaly_checkpoint"}:
+        return source
+    if source != "auto":
+        raise ValueError(f"Unsupported predictor source: {source}")
+    if not _uses_native_predictor(cfg["model"]):
+        return "anomaly_checkpoint"
+    explicit_path = cfg[section].get("checkpoint_path")
+    if explicit_path:
+        return "anomaly_checkpoint"
+    output_root = _make_output_root(cfg)
+    weights_dir = checkpoint_paths(output_root).weights_dir
+    if (weights_dir / "best.pt").exists() or (weights_dir / "last.pt").exists():
+        return "anomaly_checkpoint"
+    return "pretrained_vjepa"
+
+
 class _InferenceWrapper(nn.Module):
     def __init__(self, feature_extractor: nn.Module, predictor: nn.Module, model_cfg: dict[str, Any]) -> None:
         super().__init__()
@@ -336,8 +425,8 @@ class _InferenceWrapper(nn.Module):
         self.tubelet_size = feature_extractor.tubelet_size
 
     def forward(self, past: torch.Tensor, future: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        past_feat = self.feature_extractor(past)
-        future_feat = self.feature_extractor(future)
+        features = self.feature_extractor(torch.cat([past, future], dim=2))
+        past_feat = future_feat = features
         return _predict_sample_scores(
             self.predictor,
             past_feat,
@@ -440,17 +529,10 @@ def train_from_runtime_config(config: dict[str, Any]) -> AnomalyTrainResult:
     reports = output_root / "reports"
     paths.weights_dir.mkdir(parents=True, exist_ok=True)
     reports.mkdir(parents=True, exist_ok=True)
-    feature_extractor = build_feature_extractor(
-        model_name=cfg["model"]["name"],
-        checkpoint_path=cfg["model"]["checkpoint"],
-        checkpoint_key=cfg["model"]["checkpoint_key"],
-        num_frames=cfg["dataset"]["past_frames"],
-        image_size=cfg["dataset"]["image_size"],
-        device=device,
-    )
+    feature_extractor, predictor = _build_components(cfg, device)
     feature_extractor = runtime.prepare_module(feature_extractor.eval(), training=False)
     loaders = _make_loaders_compat(cfg, include_test=False, feature_extractor=feature_extractor, device=device, runtime=runtime)
-    predictor = runtime.prepare_module(build_predictor(cfg["model"], feature_extractor), training=True)
+    predictor = runtime.prepare_module(predictor, training=True)
     train_settings = build_train_settings(cfg["train"], epochs=int(cfg["train"]["epochs"]), batch_size=int(cfg["train"]["batch_size"]))
     backbone_ref = getattr(feature_extractor, "encoder", feature_extractor)
     optimization_host = type("AnomalyOptimizationHost", (), {"backbone": backbone_ref, "head": predictor})()
@@ -460,7 +542,7 @@ def train_from_runtime_config(config: dict[str, Any]) -> AnomalyTrainResult:
     optimizer = torch.optim.AdamW(
         [
             {
-                "params": list(predictor.parameters()),
+                "params": [parameter for parameter in predictor.parameters() if parameter.requires_grad],
                 "lr": effective_lr,
                 "initial_lr": effective_lr,
                 "weight_decay": float(stage0.optimizer.get("weight_decay", cfg["train"]["weight_decay"])),
@@ -481,7 +563,7 @@ def train_from_runtime_config(config: dict[str, Any]) -> AnomalyTrainResult:
     resume_path = resolve_resume_path(cfg["train"].get("resume", False), run_dir=output_root)
     if resume_path is not None:
         checkpoint = load_checkpoint(resume_path)
-        predictor.load_state_dict(_predictor_state_dict_from_checkpoint(checkpoint, resume_path))
+        _load_predictor_state(predictor, _predictor_state_dict_from_checkpoint(checkpoint, resume_path))
         if checkpoint.get("optimizer_state") is not None:
             optimizer.load_state_dict(checkpoint["optimizer_state"])
         if checkpoint.get("scheduler_state") is not None:
@@ -501,7 +583,7 @@ def train_from_runtime_config(config: dict[str, Any]) -> AnomalyTrainResult:
         for batch in train_bar:
             train_decode_times.append(float(batch.get("decode_time", 0.0)))
             model_start = time.perf_counter()
-            past_feat, future_feat = _extract_pair_features(feature_extractor, batch, runtime)
+            past_feat, future_feat = _extract_pair_features(feature_extractor, batch, runtime, cfg["model"])
             with runtime.autocast_context():
                 loss, _ = anomaly_future_prediction_loss(predictor, past_feat, future_feat, cfg["model"])
             optimizer.zero_grad(set_to_none=True)
@@ -528,7 +610,7 @@ def train_from_runtime_config(config: dict[str, Any]) -> AnomalyTrainResult:
             for batch in val_bar:
                 val_decode_times.append(float(batch.get("decode_time", 0.0)))
                 model_start = time.perf_counter()
-                past_feat, future_feat = _extract_pair_features(feature_extractor, batch, runtime)
+                past_feat, future_feat = _extract_pair_features(feature_extractor, batch, runtime, cfg["model"])
                 with runtime.autocast_context():
                     predictor_scores_t, frozen_scores_t = _predict_sample_scores(
                         predictor,
@@ -676,20 +758,15 @@ def _run_eval(config: dict[str, Any], *, split: str) -> tuple[dict[str, Any], Pa
     plots = output_root / "plots"
     reports.mkdir(parents=True, exist_ok=True)
     plots.mkdir(parents=True, exist_ok=True)
-    feature_extractor = build_feature_extractor(
-        model_name=cfg["model"]["name"],
-        checkpoint_path=cfg["model"]["checkpoint"],
-        checkpoint_key=cfg["model"]["checkpoint_key"],
-        num_frames=cfg["dataset"]["past_frames"],
-        image_size=cfg["dataset"]["image_size"],
-        device=device,
-    )
+    feature_extractor, predictor = _build_components(cfg, device)
     feature_extractor = runtime.prepare_module(feature_extractor.eval(), training=False)
     loaders = _make_loaders_compat(cfg, include_test=True, feature_extractor=feature_extractor, device=device)
-    predictor = runtime.prepare_module(build_predictor(cfg["model"], feature_extractor).eval(), training=False)
-    checkpoint_path = _resolve_checkpoint_path(cfg, "eval")
-    checkpoint = load_checkpoint(checkpoint_path)
-    predictor.load_state_dict(_predictor_state_dict_from_checkpoint(checkpoint, checkpoint_path))
+    predictor = runtime.prepare_module(predictor.eval(), training=False)
+    checkpoint_path = None
+    if _resolve_predictor_source(cfg, "eval") == "anomaly_checkpoint":
+        checkpoint_path = _resolve_checkpoint_path(cfg, "eval")
+        checkpoint = load_checkpoint(checkpoint_path)
+        _load_predictor_state(predictor, _predictor_state_dict_from_checkpoint(checkpoint, checkpoint_path))
     predictor.eval()
     summary, timings = _aggregate_scores(
         loaders["val_loader"] if split == "val" else loaders["test_loader"],
@@ -749,7 +826,7 @@ def _run_eval(config: dict[str, Any], *, split: str) -> tuple[dict[str, Any], Pa
         "frozen_diff_clip_confusion_matrix": frozen_clip["confusion_matrix"],
         "frozen_diff_clip_counts": frozen_clip["counts"],
         "smoothing_window": int(cfg["eval"].get("smoothing_window", 1)),
-        "checkpoint_path": str(checkpoint_path),
+        "checkpoint_path": None if checkpoint_path is None else str(checkpoint_path),
         **timings,
     }
     report_path = reports / f"{split}_metrics.json"
@@ -785,19 +862,14 @@ def _run_predict(config: dict[str, Any]) -> tuple[dict[str, Any], Path, list[str
     reports.mkdir(parents=True, exist_ok=True)
     predict_out = _predict_output_root(cfg, split=split, source=source)
     print(f"Output will be saved to: {predict_out}")
-    feature_extractor = build_feature_extractor(
-        model_name=cfg["model"]["name"],
-        checkpoint_path=cfg["model"]["checkpoint"],
-        checkpoint_key=cfg["model"]["checkpoint_key"],
-        num_frames=cfg["dataset"]["past_frames"],
-        image_size=cfg["dataset"]["image_size"],
-        device=device,
-    )
+    feature_extractor, predictor = _build_components(cfg, device)
     feature_extractor = runtime.prepare_module(feature_extractor.eval(), training=False)
-    predictor = runtime.prepare_module(build_predictor(cfg["model"], feature_extractor).eval(), training=False)
-    checkpoint_path = _resolve_checkpoint_path(cfg, "eval")
-    checkpoint = load_checkpoint(checkpoint_path)
-    predictor.load_state_dict(_predictor_state_dict_from_checkpoint(checkpoint, checkpoint_path))
+    predictor = runtime.prepare_module(predictor.eval(), training=False)
+    checkpoint_path = None
+    if _resolve_predictor_source(cfg, "eval") == "anomaly_checkpoint":
+        checkpoint_path = _resolve_checkpoint_path(cfg, "eval")
+        checkpoint = load_checkpoint(checkpoint_path)
+        _load_predictor_state(predictor, _predictor_state_dict_from_checkpoint(checkpoint, checkpoint_path))
     predictor.eval()
     if source:
         videos = [_build_source_record(source, video_backend=str(cfg["dataset"].get("video_backend", "auto")))]
@@ -827,7 +899,7 @@ def _run_predict(config: dict[str, Any]) -> tuple[dict[str, Any], Path, list[str
         "source": source,
         "predictor_type": cfg["model"]["predictor_type"],
         "smoothing_window": int(cfg["eval"].get("smoothing_window", 1)),
-        "checkpoint_path": str(checkpoint_path),
+        "checkpoint_path": None if checkpoint_path is None else str(checkpoint_path),
         "threshold": None if threshold is None else float(threshold),
         **timings,
     }
@@ -902,18 +974,13 @@ def export_from_runtime_config(config: dict[str, Any]) -> AnomalyExportResult:
         raise ValueError("Active forge anomaly export currently supports format=onnx only")
     runtime = setup_runtime(device=cfg["train"]["device"], data_cfg={"distributed": cfg.get("distributed", {})})
     device = runtime.device
-    feature_extractor = build_feature_extractor(
-        model_name=cfg["model"]["name"],
-        checkpoint_path=cfg["model"]["checkpoint"],
-        checkpoint_key=cfg["model"]["checkpoint_key"],
-        num_frames=cfg["dataset"]["past_frames"],
-        image_size=cfg["dataset"]["image_size"],
-        device=device,
-    )
-    predictor = runtime.prepare_module(build_predictor(cfg["model"], feature_extractor).eval(), training=False)
-    checkpoint_path = _resolve_checkpoint_path(cfg, "export")
-    checkpoint = load_checkpoint(checkpoint_path)
-    predictor.load_state_dict(_predictor_state_dict_from_checkpoint(checkpoint, checkpoint_path))
+    feature_extractor, predictor = _build_components(cfg, device)
+    predictor = runtime.prepare_module(predictor.eval(), training=False)
+    checkpoint_path = None
+    if _resolve_predictor_source(cfg, "export") == "anomaly_checkpoint":
+        checkpoint_path = _resolve_checkpoint_path(cfg, "export")
+        checkpoint = load_checkpoint(checkpoint_path)
+        _load_predictor_state(predictor, _predictor_state_dict_from_checkpoint(checkpoint, checkpoint_path))
     predictor.eval()
     wrapper = runtime.prepare_module(_InferenceWrapper(feature_extractor, predictor, cfg["model"]).eval(), training=False)
     output_path = Path(cfg["export"]["output_path"])
@@ -936,4 +1003,4 @@ def export_from_runtime_config(config: dict[str, Any]) -> AnomalyExportResult:
         } if cfg["export"]["dynamic_axes"] else None,
         opset_version=int(cfg["export"]["opset"]),
     )
-    return AnomalyExportResult(output_path=str(output_path), checkpoint_path=str(checkpoint_path))
+    return AnomalyExportResult(output_path=str(output_path), checkpoint_path="" if checkpoint_path is None else str(checkpoint_path))

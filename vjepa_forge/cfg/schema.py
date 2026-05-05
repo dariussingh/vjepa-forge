@@ -7,7 +7,8 @@ KNOWN_KEYS: dict[str, set[str]] = {
     "train": {
         "epochs", "batch_size", "save", "save_period", "resume", "project", "name",
         "exist_ok", "lr", "lr_mode", "lr_scale_rule", "reference_batch_size",
-        "reference_lr", "weight_decay", "num_workers", "prefetch_factor",
+        "reference_lr", "start_lr", "final_lr", "weight_decay", "final_weight_decay",
+        "warmup", "num_workers", "prefetch_factor",
         "persistent_workers", "pin_memory", "reader_cache_size", "device", "seed",
         "save_latest_every_epoch", "save_epoch_checkpoints", "scheduler",
         "early_stopping", "stages",
@@ -15,7 +16,7 @@ KNOWN_KEYS: dict[str, set[str]] = {
     "val": {
         "batch_size", "num_workers", "prefetch_factor", "persistent_workers",
         "pin_memory", "reader_cache_size", "split", "threshold_std_multiplier",
-        "smoothing_window", "checkpoint_target", "checkpoint_path",
+        "smoothing_window", "checkpoint_target", "checkpoint_path", "predictor_source",
     },
     "data": {
         "path", "_path", "task", "media", "image_size", "image_backend",
@@ -29,7 +30,7 @@ KNOWN_KEYS: dict[str, set[str]] = {
     },
     "export": {
         "format", "output_path", "opset", "dynamic_axes", "checkpoint_target",
-        "checkpoint_path",
+        "checkpoint_path", "predictor_source",
     },
     "distributed": {
         "backend", "strategy", "precision", "sync_batchnorm", "compile",

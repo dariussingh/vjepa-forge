@@ -1,3 +1,4 @@
+arch: vjepa_native
 name: vjepa2_1_vit_base_384
 backbone:
   name: vit_base
@@ -5,12 +6,9 @@ backbone:
   checkpoint_key: ema_encoder
   use_sdpa: false
   modality_embedding: false
-predictor_type: vit_patch
-hidden_dim: 1024
-dropout: 0.1
-predictor_embed_dim: 768
-predictor_depth: 12
-predictor_num_heads: 12
-predictor_use_rope: true
+predictor_checkpoint_key: predictor
+predictor_type: vjepa_native
+loss:
+  loss_exp: 1.0
 token_aggregation: topk_mean
 token_topk_fraction: 0.1

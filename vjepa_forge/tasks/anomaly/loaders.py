@@ -128,6 +128,7 @@ def _make_loaders(cfg: dict[str, Any], include_test: bool = True, *, feature_ext
     test_windows = _build_window_records(test_videos, **common) if include_test else []
     image_size = dataset_cfg["image_size"]
     video_backend = str(dataset_cfg.get("video_backend", "auto"))
+    dali_active = _dali_active(video_backend)
     train_ds = ForgeAnomalyWindowDataset(train_videos, train_windows, image_size, video_backend=video_backend)
     val_ds = ForgeAnomalyWindowDataset(val_videos, val_windows, image_size, video_backend=video_backend)
     test_ds = ForgeAnomalyWindowDataset(test_videos, test_windows, image_size, video_backend=video_backend) if include_test else None
@@ -136,8 +137,8 @@ def _make_loaders(cfg: dict[str, Any], include_test: bool = True, *, feature_ext
     if test_ds is not None:
         test_ds.reader_cache_size = int(cfg["eval"]["reader_cache_size"])
     # DALI initializes CUDA in the main process; forked workers cannot re-initialize it.
-    train_num_workers = 0 if _dali_active(video_backend) else int(cfg["train"]["num_workers"])
-    eval_num_workers = 0 if _dali_active(video_backend) else int(cfg["eval"]["num_workers"])
+    train_num_workers = 0 if dali_active else int(cfg["train"]["num_workers"])
+    eval_num_workers = 0 if dali_active else int(cfg["eval"]["num_workers"])
     train_collate = partial(
         _collate_window_batch,
         image_size=image_size,
@@ -153,7 +154,7 @@ def _make_loaders(cfg: dict[str, Any], include_test: bool = True, *, feature_ext
     train_loader_kwargs = _loader_kwargs(
         batch_size=int(cfg["train"]["batch_size"]),
         num_workers=train_num_workers,
-        pin_memory=bool(cfg["train"]["pin_memory"] and video_backend != "dali"),
+        pin_memory=bool(cfg["train"]["pin_memory"] and not dali_active),
         persistent_workers=bool(cfg["train"]["persistent_workers"]),
         prefetch_factor=int(cfg["train"]["prefetch_factor"]),
         collate_fn=train_collate,
@@ -162,7 +163,7 @@ def _make_loaders(cfg: dict[str, Any], include_test: bool = True, *, feature_ext
     eval_loader_kwargs = _loader_kwargs(
         batch_size=int(cfg["eval"]["batch_size"]),
         num_workers=eval_num_workers,
-        pin_memory=bool(cfg["eval"]["pin_memory"] and video_backend != "dali"),
+        pin_memory=bool(cfg["eval"]["pin_memory"] and not dali_active),
         persistent_workers=bool(cfg["eval"]["persistent_workers"]),
         prefetch_factor=int(cfg["eval"]["prefetch_factor"]),
         collate_fn=eval_collate,
@@ -179,7 +180,7 @@ def _make_loaders(cfg: dict[str, Any], include_test: bool = True, *, feature_ext
         test_loader_kwargs = _loader_kwargs(
             batch_size=int(cfg["eval"]["batch_size"]),
             num_workers=eval_num_workers,
-            pin_memory=bool(cfg["eval"]["pin_memory"] and video_backend != "dali"),
+            pin_memory=bool(cfg["eval"]["pin_memory"] and not dali_active),
             persistent_workers=bool(cfg["eval"]["persistent_workers"]),
             prefetch_factor=int(cfg["eval"]["prefetch_factor"]),
             collate_fn=eval_collate,
@@ -207,14 +208,15 @@ def _build_eval_loader(
         stride=dataset_cfg["stride"],
     )
     video_backend = str(dataset_cfg.get("video_backend", "auto"))
+    dali_active = _dali_active(video_backend)
     ds = ForgeAnomalyWindowDataset(videos, windows, dataset_cfg["image_size"], video_backend=video_backend)
     ds.reader_cache_size = int(cfg["eval"]["reader_cache_size"])
-    worker_count = 0 if _dali_active(video_backend) else int(cfg["eval"]["num_workers"] if num_workers is None else num_workers)
+    worker_count = 0 if dali_active else int(cfg["eval"]["num_workers"] if num_workers is None else num_workers)
     resolved_batch_size = int(cfg["eval"]["batch_size"] if batch_size is None else batch_size)
     loader_kwargs = _loader_kwargs(
         batch_size=resolved_batch_size,
         num_workers=worker_count,
-        pin_memory=bool(cfg["eval"]["pin_memory"] and video_backend != "dali"),
+        pin_memory=bool(cfg["eval"]["pin_memory"] and not dali_active),
         persistent_workers=bool(cfg["eval"]["persistent_workers"]),
         prefetch_factor=int(cfg["eval"]["prefetch_factor"]),
         collate_fn=partial(

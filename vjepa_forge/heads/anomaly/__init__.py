@@ -1,18 +1,15 @@
 from .modeling import (
-    ExtractedFeatures,
-    FeatureExtractor,
-    build_feature_extractor,
-    build_predictor,
+    NativeExtractedFeatures,
+    NativeFeatureExtractor,
+    VJEPANativePredictorAdapter,
+    build_native_components,
 )
-from .predictor_head import FuturePredictorHead, SpatialViTPredictor
 from .residual_scorer import ResidualScorer
 
 __all__ = [
-    "ExtractedFeatures",
-    "FeatureExtractor",
-    "FuturePredictorHead",
+    "NativeExtractedFeatures",
+    "NativeFeatureExtractor",
     "ResidualScorer",
-    "SpatialViTPredictor",
-    "build_feature_extractor",
-    "build_predictor",
+    "VJEPANativePredictorAdapter",
+    "build_native_components",
 ]
