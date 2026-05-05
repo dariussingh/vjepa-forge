@@ -6,6 +6,7 @@ from PIL import Image
 
 import vjepa_forge.data.converters.cafe as cafe_converter
 from vjepa_forge.data import AnomalyLoader, ClassifyLoader, DetectLoader, ForgeDataset, ForgeLabelParser, SegmentLoader, convert_cafe_to_forge
+from vjepa_forge.data.cache import CachedFeatureItem, FeatureCacheStore, cached_feature_item_key
 import vjepa_forge.data.image as image_mod
 import vjepa_forge.data.video as video_mod
 from vjepa_forge.data.forge.validator import resolve_label_path
@@ -96,6 +97,38 @@ def test_forge_dataset_and_loaders_build_expected_batch_shapes(tmp_path: Path):
     ano_dataset = ForgeDataset(ano_yaml, split="train")
     ano_batch = AnomalyLoader("image", image_size=32).collate([ano_dataset[0]])
     assert ano_batch.labels["targets"].tolist() == [1.0]
+
+
+def test_classify_loader_can_read_cached_feature_batches(tmp_path: Path):
+    image_yaml = _make_dataset(tmp_path / "image_cached", media="image", task="classify", label_lines=["cls 0"])
+    dataset = ForgeDataset(image_yaml, split="train")
+    record = dataset[0]
+    cache_dir = tmp_path / "feature_cache"
+    store = FeatureCacheStore(cache_dir)
+    store.write(
+        spec={"kind": "test"},
+        items=[
+            (
+                cached_feature_item_key(media_path=record.media_path),
+                CachedFeatureItem(
+                    mode="final",
+                    media="image",
+                    split_layer=12,
+                    token_state=None,
+                    cached_outputs=[torch.randn(768, 2, 2)],
+                    height_patches=2,
+                    width_patches=2,
+                    temporal_tokens=1,
+                ),
+            )
+        ],
+        shard_size=8,
+    )
+
+    batch = ClassifyLoader("image", image_size=32, feature_cache=store).collate([record])
+    assert batch.x.mode == "final"
+    assert len(batch.x.cached_outputs) == 1
+    assert batch.x.cached_outputs[0].shape == (1, 768, 2, 2)
 
 
 def test_resolve_label_path_supports_two_component_split_paths(tmp_path: Path):

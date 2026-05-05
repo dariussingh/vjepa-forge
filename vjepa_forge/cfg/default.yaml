@@ -19,6 +19,11 @@ data:
   image_size: 384
   image_backend: auto
   video_backend: auto
+  feature_cache: false
+  feature_cache_root: null
+  feature_cache_build_on_miss: true
+  feature_cache_readonly: false
+  feature_cache_shard_size: 64
   past_frames: 8
   future_frames: 8
   stride: 1

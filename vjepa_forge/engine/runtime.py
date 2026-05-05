@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 
+from vjepa_forge.data.cache import recursive_to_device
 
 def _parse_bool(value: Any, default: bool) -> bool:
     if value is None:
@@ -62,8 +63,8 @@ class RuntimeContext:
         return torch.inference_mode()
 
     def move_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
-        moved = tensor.to(self.device, non_blocking=True)
-        if self.config.channels_last and moved.device.type == "cuda":
+        moved = recursive_to_device(tensor, self.device)
+        if isinstance(moved, torch.Tensor) and self.config.channels_last and moved.device.type == "cuda":
             if moved.ndim == 4:
                 moved = moved.contiguous(memory_format=torch.channels_last)
             elif moved.ndim == 5:

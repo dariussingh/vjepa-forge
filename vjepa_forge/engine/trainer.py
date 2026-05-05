@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from vjepa_forge.data import AnomalyLoader, ClassifyLoader, DetectLoader, ForgeBatch, ForgeDataset, SegmentLoader
+from vjepa_forge.data.feature_cache_runtime import resolve_generic_cache_store
 from vjepa_forge.engine.checkpointing import checkpoint_paths, checkpoint_payload, load_checkpoint, resolve_resume_path, resolve_run_dir, results_csv_rows, save_checkpoint, write_results_csv
 from vjepa_forge.engine.optimization import (
     EarlyStoppingState,
@@ -87,6 +88,7 @@ class BaseTrainer:
             resume=self.resume,
         )
         self.paths = checkpoint_paths(self.run_dir)
+        self._active_freeze_cfg: dict[str, Any] | None = None
 
     def build_dataset(self, split: str = "train") -> ForgeDataset:
         return ForgeDataset(self.data, split=split)
@@ -99,14 +101,21 @@ class BaseTrainer:
         reader_cache_size = int(self.model.data_cfg.get("reader_cache_size", 4))
         video_backend = str(self.model.data_cfg.get("video_backend", "auto"))
         image_backend = str(self.model.data_cfg.get("image_backend", "auto"))
+        feature_cache = resolve_generic_cache_store(
+            dataset=dataset,
+            model=self.model,
+            split=split,
+            data_cfg=self.model.data_cfg,
+            freeze_cfg=self._active_freeze_cfg if split == "train" else self._active_freeze_cfg,
+        )
         if dataset.task == "classify":
-            collator = ClassifyLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size, reader_cache_size=reader_cache_size, video_backend=video_backend, image_backend=image_backend)
+            collator = ClassifyLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size, reader_cache_size=reader_cache_size, video_backend=video_backend, image_backend=image_backend, feature_cache=feature_cache)
         elif dataset.task == "detect":
-            collator = DetectLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size, reader_cache_size=reader_cache_size, video_backend=video_backend, image_backend=image_backend)
+            collator = DetectLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size, reader_cache_size=reader_cache_size, video_backend=video_backend, image_backend=image_backend, feature_cache=feature_cache)
         elif dataset.task == "segment":
-            collator = SegmentLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size, reader_cache_size=reader_cache_size, video_backend=video_backend, image_backend=image_backend)
+            collator = SegmentLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size, reader_cache_size=reader_cache_size, video_backend=video_backend, image_backend=image_backend, feature_cache=feature_cache)
         else:
-            collator = AnomalyLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size, reader_cache_size=reader_cache_size, video_backend=video_backend, image_backend=image_backend)
+            collator = AnomalyLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size, reader_cache_size=reader_cache_size, video_backend=video_backend, image_backend=image_backend, feature_cache=feature_cache)
         worker_count = int(self.num_workers)
         if dataset.media == "video" and video_backend == "dali":
             worker_count = 0
@@ -375,10 +384,11 @@ class BaseTrainer:
             torch.backends.cudnn.benchmark = True
         self.model = self.model.to(self.device)
         train_model = self.runtime.prepare_module(self.model, training=True)
-        loader = self.build_loader(split="train")
         train_settings = build_train_settings(self.model.data_cfg, epochs=self.epochs, batch_size=self.batch_size)
         stages = normalize_stages(task=str(getattr(self.model, "task", "classify")), model=self.model, train_cfg=train_settings, default_epochs=self.epochs, batch_size=self.batch_size)
+        self._active_freeze_cfg = dict(stages[0].freeze)
         apply_stage_freeze(self.model, stages[0])
+        loader = self.build_loader(split="train")
         optimizer = build_optimizer(self.model, stages[0], batch_size=self.batch_size)
         scheduler = build_scheduler(optimizer, stages[0], steps_per_epoch=len(loader))
         start_epoch, steps, best_fitness, rows = self._load_resume_state(optimizer, scheduler)
@@ -388,7 +398,9 @@ class BaseTrainer:
         running_epoch = 0
         global_best_state = None if not hasattr(self.model, "state_dict") else {key: value.detach().cpu().clone() for key, value in self.model.state_dict().items()}
         for stage in stages:
+            self._active_freeze_cfg = dict(stage.freeze)
             apply_stage_freeze(self.model, stage)
+            loader = self.build_loader(split="train")
             optimizer = build_optimizer(self.model, stage, batch_size=self.batch_size)
             scheduler = build_scheduler(optimizer, stage, steps_per_epoch=len(loader))
             stage_stop = EarlyStoppingState(best=None, bad_epochs=0, stopped=False)

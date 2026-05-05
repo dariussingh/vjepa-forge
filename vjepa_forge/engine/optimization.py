@@ -180,14 +180,30 @@ def apply_stage_freeze(model, stage: StageSpec) -> None:
     if backbone_blocks is not None:
         total_blocks = int(model.backbone.get_num_layers())
         trainable_from = max(0, total_blocks - int(backbone_blocks))
-        patch_embed = getattr(model.backbone, "patch_embed", None)
-        if patch_embed is not None:
-            for parameter in patch_embed.parameters():
-                parameter.requires_grad = False
-        for idx, block in enumerate(model.backbone.blocks):
-            trainable = idx >= trainable_from
-            for parameter in block.parameters():
-                parameter.requires_grad = trainable
+        patch_embeds = []
+        if hasattr(model.backbone, "image_backbone") and hasattr(model.backbone, "video_backbone"):
+            patch_embeds.extend(
+                [
+                    getattr(model.backbone.image_backbone, "patch_embed", None),
+                    getattr(model.backbone.video_backbone, "patch_embed", None),
+                ]
+            )
+            block_groups = [
+                getattr(model.backbone.image_backbone, "blocks", []),
+                getattr(model.backbone.video_backbone, "blocks", []),
+            ]
+        else:
+            patch_embeds.append(getattr(model.backbone, "patch_embed", None))
+            block_groups = [getattr(model.backbone, "blocks", [])]
+        for patch_embed in patch_embeds:
+            if patch_embed is not None:
+                for parameter in patch_embed.parameters():
+                    parameter.requires_grad = False
+        for blocks in block_groups:
+            for idx, block in enumerate(blocks):
+                trainable = idx >= trainable_from
+                for parameter in block.parameters():
+                    parameter.requires_grad = trainable
 
 
 def _parameter_component(name: str) -> str:

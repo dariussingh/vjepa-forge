@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from vjepa_forge.data.cache import CachedFeatureBatch, CachedFeatureItem
 from vjepa_forge.models import vision_transformer as vjepa_vit
 from vjepa_forge.utils.checkpoint_loader import robust_checkpoint_loader
 
@@ -110,6 +111,14 @@ class VJEPAImageBackbone(nn.Module):
         if checkpoint:
             self.load_checkpoint(checkpoint, checkpoint_key=checkpoint_key)
 
+    @property
+    def blocks(self):
+        return self.encoder.blocks
+
+    @property
+    def patch_embed(self):
+        return self.encoder.patch_embed_img
+
     def load_checkpoint(self, checkpoint_path: str, checkpoint_key: str = "ema_encoder") -> None:
         logger.info("Loading V-JEPA checkpoint from %s (key=%s)", checkpoint_path, checkpoint_key)
         checkpoint = robust_checkpoint_loader(checkpoint_path, map_location="cpu")
@@ -132,33 +141,105 @@ class VJEPAImageBackbone(nn.Module):
         for parameter in self.encoder.parameters():
             parameter.requires_grad = True
 
-    def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
+    def get_num_layers(self) -> int:
+        return len(self.encoder.blocks)
+
+    def _prepare_tokens(self, x: torch.Tensor) -> tuple[torch.Tensor, int, int, int, str]:
         if x.ndim != 4:
             raise ValueError(f"Expected BCHW image tensor, got shape {tuple(x.shape)}")
-
         _, _, height, width = x.shape
         height_patches = height // self.patch_size
         width_patches = width // self.patch_size
-        # Route images through V-JEPA's image-mode branch while keeping a BCHW public API.
-        x = x.unsqueeze(2)
-        outputs = self.encoder(x)
-        if not isinstance(outputs, Iterable):
-            raise TypeError("Expected hierarchical encoder outputs")
+        prepared = x.unsqueeze(2)
+        tokens = self.encoder.patch_embed_img(prepared)
+        if self.encoder.modality_embedding:
+            tokens = tokens + self.encoder.img_mod_embed.repeat(tokens.shape[0], 1, 1)
+        return tokens, 1, height_patches, width_patches, "img"
 
-        features = []
-        for tokens in outputs:
-            if tokens.ndim != 3:
-                raise ValueError(f"Expected token tensor shaped [B, N, C], got {tuple(tokens.shape)}")
-            batch_size, num_tokens, channels = tokens.shape
-            expected_tokens = height_patches * width_patches
-            if num_tokens != expected_tokens:
-                raise ValueError(
-                    f"Cannot reshape {num_tokens} tokens into feature map "
-                    f"{height_patches}x{width_patches} for input {height}x{width}"
-                )
-            feature_map = tokens.transpose(1, 2).reshape(batch_size, channels, height_patches, width_patches)
-            features.append(feature_map)
-        return features
+    def _feature_map(self, tokens: torch.Tensor, *, height_patches: int, width_patches: int) -> torch.Tensor:
+        batch_size, num_tokens, channels = tokens.shape
+        expected_tokens = height_patches * width_patches
+        if num_tokens != expected_tokens:
+            raise ValueError(f"Cannot reshape {num_tokens} tokens into {height_patches}x{width_patches}")
+        return tokens.transpose(1, 2).reshape(batch_size, channels, height_patches, width_patches)
+
+    def _run_blocks(
+        self,
+        tokens: torch.Tensor,
+        *,
+        start_layer: int,
+        end_layer: int,
+        T: int,
+        height_patches: int,
+        width_patches: int,
+        mode: str,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        outputs: list[torch.Tensor] = []
+        x = tokens
+        for idx in range(start_layer, end_layer):
+            block = self.encoder.blocks[idx]
+            x, _ = block(
+                x,
+                mask=None,
+                T=T,
+                H_patches=height_patches,
+                W_patches=width_patches,
+                return_attn=self.encoder.attn_out,
+                mode=mode,
+            )
+            if self.out_layers is not None and idx in self.out_layers:
+                out_idx = self.encoder.hierarchical_layers.index(idx)
+                out_norm = self.encoder.norms_block[out_idx](x)
+                outputs.append(self._feature_map(out_norm, height_patches=height_patches, width_patches=width_patches))
+        return x, outputs
+
+    def build_cache_item(self, x: torch.Tensor, *, split_layer: int) -> CachedFeatureItem:
+        total_layers = self.get_num_layers()
+        tokens, T, height_patches, width_patches, mode = self._prepare_tokens(x)
+        if split_layer >= total_layers:
+            _, outputs = self._run_blocks(tokens, start_layer=0, end_layer=total_layers, T=T, height_patches=height_patches, width_patches=width_patches, mode=mode)
+            return CachedFeatureItem(
+                mode="final",
+                media="image",
+                split_layer=total_layers,
+                token_state=None,
+                cached_outputs=[feature[0].cpu() for feature in outputs],
+                height_patches=height_patches,
+                width_patches=width_patches,
+                temporal_tokens=1,
+            )
+        prefix_tokens, outputs = self._run_blocks(tokens, start_layer=0, end_layer=split_layer, T=T, height_patches=height_patches, width_patches=width_patches, mode=mode)
+        return CachedFeatureItem(
+            mode="prefix",
+            media="image",
+            split_layer=split_layer,
+            token_state=prefix_tokens[0].detach().cpu(),
+            cached_outputs=[feature[0].detach().cpu() for feature in outputs],
+            height_patches=height_patches,
+            width_patches=width_patches,
+            temporal_tokens=1,
+        )
+
+    def forward_cached(self, batch: CachedFeatureBatch) -> list[torch.Tensor]:
+        if batch.mode == "final":
+            return list(batch.cached_outputs)
+        if batch.token_state is None:
+            raise ValueError("Cached prefix batch requires token_state")
+        _, outputs = self._run_blocks(
+            batch.token_state,
+            start_layer=batch.split_layer,
+            end_layer=self.get_num_layers(),
+            T=1,
+            height_patches=batch.height_patches,
+            width_patches=batch.width_patches,
+            mode="img",
+        )
+        return [*list(batch.cached_outputs), *outputs]
+
+    def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
+        tokens, T, height_patches, width_patches, mode = self._prepare_tokens(x)
+        _, outputs = self._run_blocks(tokens, start_layer=0, end_layer=self.get_num_layers(), T=T, height_patches=height_patches, width_patches=width_patches, mode=mode)
+        return outputs
 
 
 class VJEPAVideoBackbone(nn.Module):
@@ -209,6 +290,14 @@ class VJEPAVideoBackbone(nn.Module):
         if checkpoint:
             self.load_checkpoint(checkpoint, checkpoint_key=checkpoint_key)
 
+    @property
+    def blocks(self):
+        return self.encoder.blocks
+
+    @property
+    def patch_embed(self):
+        return self.encoder.patch_embed
+
     def load_checkpoint(self, checkpoint_path: str, checkpoint_key: str = "ema_encoder") -> None:
         checkpoint = robust_checkpoint_loader(checkpoint_path, map_location="cpu")
         state_dict = _select_checkpoint_state(checkpoint, checkpoint_key)
@@ -226,36 +315,105 @@ class VJEPAVideoBackbone(nn.Module):
         for parameter in self.encoder.parameters():
             parameter.requires_grad = True
 
-    def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
+    def get_num_layers(self) -> int:
+        return len(self.encoder.blocks)
+
+    def _prepare_tokens(self, x: torch.Tensor) -> tuple[torch.Tensor, int, int, int, str]:
         if x.ndim != 5:
             raise ValueError(f"Expected BCTHW video tensor, got shape {tuple(x.shape)}")
-        batch_size, _, time, height, width = x.shape
+        _, _, time, height, width = x.shape
         height_patches = height // self.patch_size
         width_patches = width // self.patch_size
         temporal_tokens = max(1, time // self.tubelet_size)
-        outputs = self.encoder(x)
-        if not isinstance(outputs, Iterable):
-            raise TypeError("Expected hierarchical encoder outputs")
-        features = []
-        for tokens in outputs:
-            if tokens.ndim != 3:
-                raise ValueError(f"Expected token tensor shaped [B, N, C], got {tuple(tokens.shape)}")
-            _, num_tokens, channels = tokens.shape
-            expected_tokens = temporal_tokens * height_patches * width_patches
-            if num_tokens != expected_tokens:
-                raise ValueError(
-                    f"Cannot reshape {num_tokens} tokens into feature volume "
-                    f"{temporal_tokens}x{height_patches}x{width_patches}"
-                )
-            feature_volume = tokens.transpose(1, 2).reshape(
-                batch_size,
-                channels,
-                temporal_tokens,
-                height_patches,
-                width_patches,
+        tokens = self.encoder.patch_embed(x)
+        if self.encoder.modality_embedding:
+            tokens = tokens + self.encoder.video_mod_embed.repeat(tokens.shape[0], 1, 1)
+        return tokens, temporal_tokens, height_patches, width_patches, "video"
+
+    def _feature_volume(self, tokens: torch.Tensor, *, temporal_tokens: int, height_patches: int, width_patches: int) -> torch.Tensor:
+        batch_size, num_tokens, channels = tokens.shape
+        expected_tokens = temporal_tokens * height_patches * width_patches
+        if num_tokens != expected_tokens:
+            raise ValueError(f"Cannot reshape {num_tokens} tokens into {temporal_tokens}x{height_patches}x{width_patches}")
+        return tokens.transpose(1, 2).reshape(batch_size, channels, temporal_tokens, height_patches, width_patches)
+
+    def _run_blocks(
+        self,
+        tokens: torch.Tensor,
+        *,
+        start_layer: int,
+        end_layer: int,
+        temporal_tokens: int,
+        height_patches: int,
+        width_patches: int,
+        mode: str,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        outputs: list[torch.Tensor] = []
+        x = tokens
+        for idx in range(start_layer, end_layer):
+            block = self.encoder.blocks[idx]
+            x, _ = block(
+                x,
+                mask=None,
+                T=temporal_tokens,
+                H_patches=height_patches,
+                W_patches=width_patches,
+                return_attn=self.encoder.attn_out,
+                mode=mode,
             )
-            features.append(feature_volume)
-        return features
+            if self.out_layers is not None and idx in self.out_layers:
+                out_idx = self.encoder.hierarchical_layers.index(idx)
+                out_norm = self.encoder.norms_block[out_idx](x)
+                outputs.append(self._feature_volume(out_norm, temporal_tokens=temporal_tokens, height_patches=height_patches, width_patches=width_patches))
+        return x, outputs
+
+    def build_cache_item(self, x: torch.Tensor, *, split_layer: int) -> CachedFeatureItem:
+        total_layers = self.get_num_layers()
+        tokens, temporal_tokens, height_patches, width_patches, mode = self._prepare_tokens(x)
+        if split_layer >= total_layers:
+            _, outputs = self._run_blocks(tokens, start_layer=0, end_layer=total_layers, temporal_tokens=temporal_tokens, height_patches=height_patches, width_patches=width_patches, mode=mode)
+            return CachedFeatureItem(
+                mode="final",
+                media="video",
+                split_layer=total_layers,
+                token_state=None,
+                cached_outputs=[feature[0].cpu() for feature in outputs],
+                height_patches=height_patches,
+                width_patches=width_patches,
+                temporal_tokens=temporal_tokens,
+            )
+        prefix_tokens, outputs = self._run_blocks(tokens, start_layer=0, end_layer=split_layer, temporal_tokens=temporal_tokens, height_patches=height_patches, width_patches=width_patches, mode=mode)
+        return CachedFeatureItem(
+            mode="prefix",
+            media="video",
+            split_layer=split_layer,
+            token_state=prefix_tokens[0].detach().cpu(),
+            cached_outputs=[feature[0].detach().cpu() for feature in outputs],
+            height_patches=height_patches,
+            width_patches=width_patches,
+            temporal_tokens=temporal_tokens,
+        )
+
+    def forward_cached(self, batch: CachedFeatureBatch) -> list[torch.Tensor]:
+        if batch.mode == "final":
+            return list(batch.cached_outputs)
+        if batch.token_state is None:
+            raise ValueError("Cached prefix batch requires token_state")
+        _, outputs = self._run_blocks(
+            batch.token_state,
+            start_layer=batch.split_layer,
+            end_layer=self.get_num_layers(),
+            temporal_tokens=batch.temporal_tokens,
+            height_patches=batch.height_patches,
+            width_patches=batch.width_patches,
+            mode="video",
+        )
+        return [*list(batch.cached_outputs), *outputs]
+
+    def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
+        tokens, temporal_tokens, height_patches, width_patches, mode = self._prepare_tokens(x)
+        _, outputs = self._run_blocks(tokens, start_layer=0, end_layer=self.get_num_layers(), temporal_tokens=temporal_tokens, height_patches=height_patches, width_patches=width_patches, mode=mode)
+        return outputs
 
 
 class ConvBNAct(nn.Module):

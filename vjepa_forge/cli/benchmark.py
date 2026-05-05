@@ -29,6 +29,7 @@ def main() -> None:
     model_cfg["task"] = config["task"]
     model_cfg["media"] = config["media"]
     data_cfg = dict(config["data"])
+    data_cfg["train"] = dict(config.get("train", {}))
     data_cfg["distributed"] = dict(config.get("distributed", {}))
     runtime = setup_runtime(device=str(config["train"].get("device", "cpu")), data_cfg=data_cfg)
     model = ForgeModel(model_cfg, data=data_cfg)

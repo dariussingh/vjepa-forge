@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 
 
 @dataclass
 class ForgeBatch:
-    x: torch.Tensor
+    x: Any
     media: Literal["image", "video"]
     task: Literal["classify", "detect", "segment", "anomaly"]
     labels: dict

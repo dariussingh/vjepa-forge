@@ -6,6 +6,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from vjepa_forge.data.cache import CachedFeatureBatch
 from vjepa_forge.cfg.loader import load_model_config
 from vjepa_forge.data import ForgeBatch
 from vjepa_forge.models.builders import build_backbone, build_head
@@ -31,7 +32,9 @@ class ForgeModel(BaseForgeModel):
         self.head = build_head(self.task, self.media, model_cfg, self.backbone.embed_dim)
 
     def forward(self, batch: ForgeBatch):
-        if batch.media == "image":
+        if isinstance(batch.x, CachedFeatureBatch):
+            feats = self.backbone.forward_cached(batch.x)
+        elif batch.media == "image":
             feats = self.backbone.forward_image(batch.x)
         elif batch.media == "video":
             feats = self.backbone.forward_video(batch.x)

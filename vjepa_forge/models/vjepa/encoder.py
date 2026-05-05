@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from vjepa_forge.backbones import VJEPAImageBackbone, VJEPAVideoBackbone
+from vjepa_forge.data.cache import CachedFeatureBatch
 
 from .tokenizer_image import VJEPAImageTokenizer
 from .tokenizer_video import VJEPAVideoTokenizer
@@ -36,8 +37,33 @@ class VJEPA21Backbone(nn.Module):
         )
         self.embed_dim = self.image_backbone.embed_dim
 
+    @property
+    def blocks(self):
+        return self.image_backbone.blocks
+
+    @property
+    def patch_embed(self):
+        return nn.ModuleList([self.image_backbone.patch_embed, self.video_backbone.patch_embed])
+
+    def get_num_layers(self) -> int:
+        return self.image_backbone.get_num_layers()
+
     def forward_image(self, x: torch.Tensor) -> list[torch.Tensor]:
         return self.image_backbone(self.image_tokenizer(x))
 
     def forward_video(self, x: torch.Tensor) -> list[torch.Tensor]:
         return self.video_backbone(self.video_tokenizer(x))
+
+    def build_cache_item(self, x: torch.Tensor, *, media: str, split_layer: int):
+        if media == "image":
+            return self.image_backbone.build_cache_item(self.image_tokenizer(x), split_layer=split_layer)
+        if media == "video":
+            return self.video_backbone.build_cache_item(self.video_tokenizer(x), split_layer=split_layer)
+        raise ValueError(f"Unsupported media for cache item build: {media}")
+
+    def forward_cached(self, cached: CachedFeatureBatch) -> list[torch.Tensor]:
+        if cached.media == "image":
+            return self.image_backbone.forward_cached(cached)
+        if cached.media == "video":
+            return self.video_backbone.forward_cached(cached)
+        raise ValueError(f"Unsupported cached media: {cached.media}")
