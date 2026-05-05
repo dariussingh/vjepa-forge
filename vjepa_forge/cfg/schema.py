@@ -19,12 +19,9 @@ KNOWN_KEYS: dict[str, set[str]] = {
     },
     "data": {
         "path", "_path", "task", "media", "image_size", "image_backend",
-        "video_backend", "feature_cache", "feature_cache_root",
-        "feature_cache_build_on_miss", "feature_cache_readonly",
-        "feature_cache_shard_size", "feature_cache_batch_size", "feature_cache_dtype",
-        "train_fraction", "train_seed", "past_frames", "future_frames", "stride",
-        "augment", "dataset_yaml", "config", "clip_len", "clip_stride", "num_frames",
-        "num_classes", "root", "names", "splits", "labels", "masks",
+        "video_backend", "train_fraction", "train_seed", "past_frames", "future_frames",
+        "stride", "augment", "dataset_yaml", "config", "clip_len", "clip_stride",
+        "num_frames", "num_classes", "root", "names", "splits", "labels", "masks",
     },
     "predict": {
         "source", "batch_size", "num_workers", "split", "threshold", "visualize",

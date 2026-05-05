@@ -11,7 +11,6 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from vjepa_forge.data import AnomalyLoader, ClassifyLoader, DetectLoader, ForgeBatch, ForgeDataset, SegmentLoader
-from vjepa_forge.data.feature_cache_runtime import resolve_generic_cache_store
 from vjepa_forge.engine.checkpointing import checkpoint_paths, checkpoint_payload, load_checkpoint, resolve_resume_path, resolve_run_dir, results_csv_rows, save_checkpoint, write_results_csv
 from vjepa_forge.engine.optimization import (
     EarlyStoppingState,
@@ -101,24 +100,14 @@ class BaseTrainer:
         reader_cache_size = int(self.model.data_cfg.get("reader_cache_size", 4))
         video_backend = str(self.model.data_cfg.get("video_backend", "auto"))
         image_backend = str(self.model.data_cfg.get("image_backend", "auto"))
-        feature_cache = resolve_generic_cache_store(
-            dataset=dataset,
-            model=self.model,
-            split=split,
-            data_cfg=self.model.data_cfg,
-            freeze_cfg=self._active_freeze_cfg,
-            runtime=self.runtime,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-        )
         if dataset.task == "classify":
-            collator = ClassifyLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size, reader_cache_size=reader_cache_size, video_backend=video_backend, image_backend=image_backend, feature_cache=feature_cache)
+            collator = ClassifyLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size, reader_cache_size=reader_cache_size, video_backend=video_backend, image_backend=image_backend)
         elif dataset.task == "detect":
-            collator = DetectLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size, reader_cache_size=reader_cache_size, video_backend=video_backend, image_backend=image_backend, feature_cache=feature_cache)
+            collator = DetectLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size, reader_cache_size=reader_cache_size, video_backend=video_backend, image_backend=image_backend)
         elif dataset.task == "segment":
-            collator = SegmentLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size, reader_cache_size=reader_cache_size, video_backend=video_backend, image_backend=image_backend, feature_cache=feature_cache)
+            collator = SegmentLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size, reader_cache_size=reader_cache_size, video_backend=video_backend, image_backend=image_backend)
         else:
-            collator = AnomalyLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size, reader_cache_size=reader_cache_size, video_backend=video_backend, image_backend=image_backend, feature_cache=feature_cache)
+            collator = AnomalyLoader(dataset.media, clip_len=clip_len, clip_stride=clip_stride, image_size=image_size, reader_cache_size=reader_cache_size, video_backend=video_backend, image_backend=image_backend)
         worker_count = int(self.num_workers)
         if dataset.media == "video" and video_backend == "dali":
             worker_count = 0

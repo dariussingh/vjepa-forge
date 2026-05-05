@@ -85,12 +85,6 @@ def _build_cfg(config: dict[str, Any], *, action: str) -> dict[str, Any]:
             "future_frames": int(data_cfg.get("future_frames", data_cfg.get("num_frames", 8))),
             "stride": int(data_cfg.get("stride", 1)),
             "video_backend": str(data_cfg.get("video_backend", "auto")),
-            "feature_cache": str(data_cfg.get("feature_cache", "false")),
-            "feature_cache_root": data_cfg.get("feature_cache_root"),
-            "feature_cache_build_on_miss": bool(data_cfg.get("feature_cache_build_on_miss", True)),
-            "feature_cache_readonly": bool(data_cfg.get("feature_cache_readonly", False)),
-            "feature_cache_shard_size": int(data_cfg.get("feature_cache_shard_size", 64)),
-            "feature_cache_dtype": str(data_cfg.get("feature_cache_dtype", "fp16")),
             "train_fraction": float(data_cfg.get("train_fraction", 1.0)),
         },
         "model": {
@@ -170,17 +164,6 @@ def _build_cfg(config: dict[str, Any], *, action: str) -> dict[str, Any]:
 
 
 def _extract_pair_features(feature_extractor: nn.Module, batch: dict[str, Any], runtime) -> tuple[ExtractedFeatures, ExtractedFeatures]:
-    if "past_pooled" in batch:
-        # Cached tensors may be stored as fp16/bf16 to save disk; cast to fp32 before
-        # passing to the predictor so LayerNorm and other ops always receive full precision.
-        # AMP autocast will downcast to bf16/fp16 again for the ops that benefit from it.
-        def _load(t: torch.Tensor) -> torch.Tensor:
-            return runtime.move_tensor(t).float()
-
-        return (
-            ExtractedFeatures(pooled=_load(batch["past_pooled"]), tokens=_load(batch["past_tokens"])),
-            ExtractedFeatures(pooled=_load(batch["future_pooled"]), tokens=_load(batch["future_tokens"])),
-        )
     past = runtime.move_tensor(batch["past"])
     future = runtime.move_tensor(batch["future"])
     with torch.no_grad():
