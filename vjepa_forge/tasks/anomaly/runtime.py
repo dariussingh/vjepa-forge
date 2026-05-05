@@ -271,7 +271,7 @@ def _build_cfg(config: dict[str, Any], *, action: str) -> dict[str, Any]:
             "early_stopping": dict(config["train"].get("early_stopping", {})),
         },
         "eval": {
-            "batch_size": int(config["val"].get("batch_size", 1)),
+            "batch_size": int(config["val"].get("batch_size", config["train"].get("batch_size", 1))),
             "num_workers": int(config["val"].get("num_workers", default_workers)),
             "prefetch_factor": int(config["val"].get("prefetch_factor", 2)),
             "persistent_workers": bool(config["val"].get("persistent_workers", True)),
@@ -877,15 +877,15 @@ def _build_eval_loader(
 
 def _extract_pair_features(feature_extractor: nn.Module, batch: dict[str, Any], runtime) -> tuple[ExtractedFeatures, ExtractedFeatures]:
     if "past_pooled" in batch:
+        # Cached tensors may be stored as fp16/bf16 to save disk; cast to fp32 before
+        # passing to the predictor so LayerNorm and other ops always receive full precision.
+        # AMP autocast will downcast to bf16/fp16 again for the ops that benefit from it.
+        def _load(t: torch.Tensor) -> torch.Tensor:
+            return runtime.move_tensor(t).float()
+
         return (
-            ExtractedFeatures(
-                pooled=runtime.move_tensor(batch["past_pooled"]),
-                tokens=runtime.move_tensor(batch["past_tokens"]),
-            ),
-            ExtractedFeatures(
-                pooled=runtime.move_tensor(batch["future_pooled"]),
-                tokens=runtime.move_tensor(batch["future_tokens"]),
-            ),
+            ExtractedFeatures(pooled=_load(batch["past_pooled"]), tokens=_load(batch["past_tokens"])),
+            ExtractedFeatures(pooled=_load(batch["future_pooled"]), tokens=_load(batch["future_tokens"])),
         )
     past = runtime.move_tensor(batch["past"])
     future = runtime.move_tensor(batch["future"])
@@ -1345,6 +1345,7 @@ def train_from_runtime_config(config: dict[str, Any]) -> AnomalyTrainResult:
         image_size=cfg["dataset"]["image_size"],
         device=device,
     )
+    feature_extractor = runtime.prepare_module(feature_extractor.eval(), training=False)
     loaders = _make_loaders_compat(cfg, include_test=False, feature_extractor=feature_extractor, device=device, runtime=runtime)
     predictor = runtime.prepare_module(build_predictor(cfg["model"], feature_extractor), training=True)
     train_settings = build_train_settings(cfg["train"], epochs=int(cfg["train"]["epochs"]), batch_size=int(cfg["train"]["batch_size"]))
@@ -1580,6 +1581,7 @@ def _run_eval(config: dict[str, Any], *, split: str) -> tuple[dict[str, Any], Pa
         image_size=cfg["dataset"]["image_size"],
         device=device,
     )
+    feature_extractor = runtime.prepare_module(feature_extractor.eval(), training=False)
     loaders = _make_loaders_compat(cfg, include_test=True, feature_extractor=feature_extractor, device=device)
     predictor = runtime.prepare_module(build_predictor(cfg["model"], feature_extractor).eval(), training=False)
     checkpoint_path = _resolve_checkpoint_path(cfg, "eval")
@@ -1688,6 +1690,7 @@ def _run_predict(config: dict[str, Any]) -> tuple[dict[str, Any], Path, list[str
         image_size=cfg["dataset"]["image_size"],
         device=device,
     )
+    feature_extractor = runtime.prepare_module(feature_extractor.eval(), training=False)
     predictor = runtime.prepare_module(build_predictor(cfg["model"], feature_extractor).eval(), training=False)
     checkpoint_path = _resolve_checkpoint_path(cfg, "eval")
     checkpoint = load_checkpoint(checkpoint_path)
