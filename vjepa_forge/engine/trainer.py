@@ -12,6 +12,18 @@ from torch.utils.data import DataLoader
 
 from vjepa_forge.data import AnomalyLoader, ClassifyLoader, DetectLoader, ForgeBatch, ForgeDataset, SegmentLoader
 from vjepa_forge.engine.checkpointing import checkpoint_paths, checkpoint_payload, load_checkpoint, resolve_resume_path, resolve_run_dir, results_csv_rows, save_checkpoint, write_results_csv
+from vjepa_forge.engine.optimization import (
+    EarlyStoppingState,
+    apply_stage_freeze,
+    build_optimizer,
+    build_scheduler,
+    build_train_settings,
+    extract_monitor_value,
+    is_improvement,
+    normalize_stages,
+    update_early_stopping,
+)
+from vjepa_forge.losses.classification import classification_loss
 
 try:
     from tqdm.auto import tqdm
@@ -125,21 +137,15 @@ class BaseTrainer:
 
     def compute_loss(self, batch: ForgeBatch, outputs) -> torch.Tensor:
         if batch.task == "classify":
-            return F.cross_entropy(outputs, batch.labels["class_ids"].to(outputs.device))
+            loss, stats = classification_loss(outputs, batch.labels["class_ids"].to(outputs.device), self.model.model_cfg.get("loss"))
+            self._last_loss_stats = stats
+            return loss
         if batch.task == "detect":
             raise NotImplementedError("Detection training/validation loss is not implemented in the generic Forge trainer")
         if batch.task == "segment":
             raise NotImplementedError("Segmentation training/validation loss is not implemented in the generic Forge trainer")
         targets = batch.labels["targets"].to(outputs.device)
         return F.binary_cross_entropy_with_logits(outputs, targets)
-
-    def build_optimizer(self) -> torch.optim.Optimizer:
-        lr = float(self.model.data_cfg.get("lr", 1.0e-4))
-        weight_decay = float(self.model.data_cfg.get("weight_decay", 1.0e-4))
-        return torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
-
-    def build_scheduler(self, optimizer: torch.optim.Optimizer):
-        return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
 
     def _validator_kwargs(self) -> dict[str, Any]:
         return {
@@ -280,6 +286,7 @@ class BaseTrainer:
         epoch: int,
         global_step: int,
         best_fitness: float,
+        stage_name: str,
         train_loss: float,
         val_loss: float | None,
         val_metrics: dict[str, Any] | None,
@@ -292,6 +299,7 @@ class BaseTrainer:
             "train_loss": train_loss,
             "val_loss": val_loss,
             "lr": float(optimizer.param_groups[0]["lr"]),
+            "stage": stage_name,
         }
         if val_metrics:
             metrics.update(val_metrics)
@@ -307,94 +315,132 @@ class BaseTrainer:
             task=str(getattr(self.model, "task", "unknown")),
             media=str(getattr(self.model, "media", "unknown")),
             checkpoint_kind=checkpoint_kind,
+            extras={
+                "stage_name": stage_name,
+                "scheduler": scheduler.state_dict() if scheduler is not None else None,
+            },
         )
         save_checkpoint(payload, target_path)
 
     def run(self) -> TrainResult:
         self.model.to(self.device)
         loader = self.build_loader(split="train")
-        optimizer = self.build_optimizer()
-        scheduler = self.build_scheduler(optimizer)
+        train_settings = build_train_settings(self.model.data_cfg, epochs=self.epochs, batch_size=self.batch_size)
+        stages = normalize_stages(task=str(getattr(self.model, "task", "classify")), model=self.model, train_cfg=train_settings, default_epochs=self.epochs, batch_size=self.batch_size)
+        apply_stage_freeze(self.model, stages[0])
+        optimizer = build_optimizer(self.model, stages[0], batch_size=self.batch_size)
+        scheduler = build_scheduler(optimizer, stages[0], steps_per_epoch=len(loader))
         start_epoch, steps, best_fitness, rows = self._load_resume_state(optimizer, scheduler)
         last_loss = 0.0
         completed_epochs = 0
-        for epoch_idx in range(start_epoch, self.epochs + 1):
-            self.model.train(True)
-            epoch_losses: list[float] = []
-            progress = self.progress(loader, desc=f"train {epoch_idx}/{self.epochs}", total=len(loader))
-            for batch in progress:
-                batch.x = batch.x.to(self.device)
-                optimizer.zero_grad(set_to_none=True)
-                outputs = self.model(batch)
-                loss = self.compute_loss(batch, outputs)
-                loss.backward()
-                optimizer.step()
-                last_loss = float(loss.detach().cpu().item())
-                epoch_losses.append(last_loss)
-                steps += 1
-                if tqdm is not None:
-                    progress.set_postfix(loss=f"{last_loss:.4f}")
-            scheduler.step()
-            train_loss = sum(epoch_losses) / max(len(epoch_losses), 1)
-            val_result = self.validate_epoch()
-            val_loss = None if val_result is None else float(val_result.loss)
-            val_metrics = None if val_result is None else val_result.metrics
-            fitness = float(val_loss if val_loss is not None else train_loss)
-            previous_best = best_fitness
-            best_fitness = min(best_fitness, fitness)
-            rows.append(
-                self._results_row(
-                    epoch=epoch_idx,
+        total_epochs = sum(stage.epochs for stage in stages)
+        running_epoch = 0
+        global_best_state = None if not hasattr(self.model, "state_dict") else {key: value.detach().cpu().clone() for key, value in self.model.state_dict().items()}
+        for stage in stages:
+            apply_stage_freeze(self.model, stage)
+            optimizer = build_optimizer(self.model, stage, batch_size=self.batch_size)
+            scheduler = build_scheduler(optimizer, stage, steps_per_epoch=len(loader))
+            stage_stop = EarlyStoppingState(best=None, bad_epochs=0, stopped=False)
+            for _local_epoch in range(stage.epochs):
+                running_epoch += 1
+                if running_epoch < start_epoch:
+                    continue
+                self.model.train(True)
+                epoch_losses: list[float] = []
+                progress = self.progress(loader, desc=f"{stage.name} {running_epoch}/{total_epochs}", total=len(loader))
+                stage_global_step = scheduler.current_step
+                for batch in progress:
+                    batch.x = batch.x.to(self.device)
+                    optimizer.zero_grad(set_to_none=True)
+                    outputs = self.model(batch)
+                    loss = self.compute_loss(batch, outputs)
+                    loss.backward()
+                    optimizer.step()
+                    current_lr = scheduler.step(stage_global_step)
+                    stage_global_step += 1
+                    last_loss = float(loss.detach().cpu().item())
+                    epoch_losses.append(last_loss)
+                    steps += 1
+                    if tqdm is not None:
+                        progress.set_postfix(loss=f"{last_loss:.4f}", lr=f"{current_lr:.2e}")
+                train_loss = sum(epoch_losses) / max(len(epoch_losses), 1)
+                val_result = self.validate_epoch()
+                val_loss = None if val_result is None else float(val_result.loss)
+                val_metrics = None if val_result is None else val_result.metrics
+                monitor_value = train_loss if val_result is None else extract_monitor_value(val_result, stage.monitor)
+                previous_best = best_fitness
+                fitness = monitor_value if stage.monitor.mode == "min" else -monitor_value
+                best_fitness = min(best_fitness, fitness)
+                row = self._results_row(
+                    epoch=running_epoch,
                     train_loss=train_loss,
                     val_loss=val_loss,
-                    lr=float(optimizer.param_groups[0]["lr"]),
+                    lr=float(max(group["lr"] for group in optimizer.param_groups)),
                     best_fitness=best_fitness,
                     val_metrics=val_metrics,
                 )
-            )
-            rows = self._normalized_results_rows(rows)
-            self._emit_epoch_summary(epoch=epoch_idx, train_loss=train_loss, val_loss=val_loss, val_metrics=val_metrics)
-            write_results_csv(self.paths.results_csv, rows)
-            if self.save:
-                self._save_epoch_checkpoint(
-                    epoch=epoch_idx,
-                    global_step=steps,
-                    best_fitness=best_fitness,
-                    train_loss=train_loss,
-                    val_loss=val_loss,
-                    val_metrics=val_metrics,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    checkpoint_kind="last",
-                    target_path=self.paths.last,
-                )
-                if fitness <= previous_best:
+                row["stage"] = stage.name
+                row["monitor_metric"] = stage.monitor.metric
+                row["monitor_value"] = monitor_value
+                for group in optimizer.param_groups:
+                    row[f"lr_{group.get('group_name', 'group')}"] = float(group["lr"])
+                rows.append(row)
+                rows = self._normalized_results_rows(rows)
+                self._emit_epoch_summary(epoch=running_epoch, train_loss=train_loss, val_loss=val_loss, val_metrics=(val_metrics or {}) | {"monitor": monitor_value})
+                write_results_csv(self.paths.results_csv, rows)
+                improved = is_improvement(monitor_value, stage_stop.best, stage.monitor, min_delta=stage.early_stopping.min_delta)
+                stage_stop = update_early_stopping(stage_stop, value=monitor_value, stage=stage, completed_stage_epochs=_local_epoch + 1)
+                if improved:
+                    global_best_state = {key: value.detach().cpu().clone() for key, value in self.model.state_dict().items()}
+                if self.save:
                     self._save_epoch_checkpoint(
-                        epoch=epoch_idx,
+                        epoch=running_epoch,
                         global_step=steps,
                         best_fitness=best_fitness,
+                        stage_name=stage.name,
                         train_loss=train_loss,
                         val_loss=val_loss,
-                        val_metrics=val_metrics,
+                        val_metrics=(val_metrics or {}) | {"monitor_value": monitor_value},
                         optimizer=optimizer,
                         scheduler=scheduler,
-                        checkpoint_kind="best",
-                        target_path=self.paths.best,
+                        checkpoint_kind="last",
+                        target_path=self.paths.last,
                     )
-                if self.save_period > 0 and epoch_idx % self.save_period == 0:
-                    self._save_epoch_checkpoint(
-                        epoch=epoch_idx,
-                        global_step=steps,
-                        best_fitness=best_fitness,
-                        train_loss=train_loss,
-                        val_loss=val_loss,
-                        val_metrics=val_metrics,
-                        optimizer=optimizer,
-                        scheduler=scheduler,
-                        checkpoint_kind="epoch",
-                        target_path=self.paths.weights_dir / f"epoch_{epoch_idx:03d}.pt",
-                    )
-            completed_epochs = epoch_idx
+                    if best_fitness <= previous_best:
+                        self._save_epoch_checkpoint(
+                            epoch=running_epoch,
+                            global_step=steps,
+                            best_fitness=best_fitness,
+                            stage_name=stage.name,
+                            train_loss=train_loss,
+                            val_loss=val_loss,
+                            val_metrics=(val_metrics or {}) | {"monitor_value": monitor_value},
+                            optimizer=optimizer,
+                            scheduler=scheduler,
+                            checkpoint_kind="best",
+                            target_path=self.paths.best,
+                        )
+                    if self.save_period > 0 and running_epoch % self.save_period == 0:
+                        self._save_epoch_checkpoint(
+                            epoch=running_epoch,
+                            global_step=steps,
+                            best_fitness=best_fitness,
+                            stage_name=stage.name,
+                            train_loss=train_loss,
+                            val_loss=val_loss,
+                            val_metrics=(val_metrics or {}) | {"monitor_value": monitor_value},
+                            optimizer=optimizer,
+                            scheduler=scheduler,
+                            checkpoint_kind="epoch",
+                            target_path=self.paths.weights_dir / f"epoch_{running_epoch:03d}.pt",
+                        )
+                completed_epochs = running_epoch
+                if stage_stop.stopped:
+                    break
+            if stage_stop.stopped and stage.early_stopping.scope == "every_stage":
+                break
+        if global_best_state is not None and stages[-1].early_stopping.restore_best:
+            self.model.load_state_dict(global_best_state, strict=False)
         return TrainResult(
             loss=last_loss,
             steps=steps,

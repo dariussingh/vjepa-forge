@@ -19,7 +19,9 @@ from torch.utils.data import DataLoader, Dataset
 from vjepa_forge.data.forge.dataset import ForgeDataset
 from vjepa_forge.data.video import get_video_frame_count, read_video_clip, read_video_clips, read_video_frames_uint8
 from vjepa_forge.engine.checkpointing import checkpoint_paths, checkpoint_payload, load_checkpoint, resolve_resume_path, resolve_run_dir, results_csv_rows, save_checkpoint, write_results_csv
+from vjepa_forge.engine.optimization import build_scheduler, build_train_settings, normalize_stages, resolve_autoscaled_lr
 from vjepa_forge.heads.anomaly.modeling import ExtractedFeatures, build_feature_extractor, build_predictor
+from vjepa_forge.losses.anomaly import anomaly_future_prediction_loss
 
 try:
     from tqdm.auto import tqdm
@@ -262,6 +264,8 @@ def _build_cfg(config: dict[str, Any], *, action: str) -> dict[str, Any]:
             "seed": int(config["train"].get("seed", 7)),
             "save_latest_every_epoch": bool(config["train"].get("save_latest_every_epoch", True)),
             "save_epoch_checkpoints": bool(config["train"].get("save_epoch_checkpoints", False)),
+            "scheduler": dict(config["train"].get("scheduler", {})),
+            "early_stopping": dict(config["train"].get("early_stopping", {})),
         },
         "eval": {
             "batch_size": int(config["val"].get("batch_size", 1)),
@@ -684,6 +688,11 @@ def _aggregate_scores(loader: DataLoader, predictor: nn.Module, feature_extracto
                 state["has_labels"] = True
                 for frame_idx, label in zip(future_indices[i], labels_np[i]):
                     state["labels"][int(frame_idx)] = int(label)
+    summary = _finalize_video_summary(by_video)
+    return summary, _timing_metrics(decode_times=decode_times, model_times=model_times)
+
+
+def _finalize_video_summary(by_video: dict[str, dict[str, Any]]) -> dict[str, Any]:
     summary: dict[str, Any] = {"videos": {}}
     for video_name, state in by_video.items():
         frame_ids = sorted(state["predictor_sum"].keys())
@@ -698,7 +707,7 @@ def _aggregate_scores(loader: DataLoader, predictor: nn.Module, feature_extracto
             "frozen_scores": frozen_series.tolist(),
             "labels": None if labels is None else labels.tolist(),
         }
-    return summary, _timing_metrics(decode_times=decode_times, model_times=model_times)
+    return summary
 
 
 def _flatten_metric_arrays(video_summary: dict[str, Any], key: str) -> tuple[np.ndarray, np.ndarray]:
@@ -998,9 +1007,26 @@ def train_from_runtime_config(config: dict[str, Any]) -> AnomalyTrainResult:
         device=device,
     )
     predictor = build_predictor(cfg["model"], feature_extractor).to(device)
-    effective_lr, _ = _resolve_effective_lr(cfg["train"])
-    optimizer = torch.optim.AdamW(predictor.parameters(), lr=effective_lr, weight_decay=cfg["train"]["weight_decay"])
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+    train_settings = build_train_settings(cfg["train"], epochs=int(cfg["train"]["epochs"]), batch_size=int(cfg["train"]["batch_size"]))
+    backbone_ref = getattr(feature_extractor, "encoder", feature_extractor)
+    optimization_host = type("AnomalyOptimizationHost", (), {"backbone": backbone_ref, "head": predictor})()
+    stages = normalize_stages(task="anomaly", model=optimization_host, train_cfg=train_settings, default_epochs=int(cfg["train"]["epochs"]), batch_size=int(cfg["train"]["batch_size"]))
+    stage0 = stages[0]
+    effective_lr = resolve_autoscaled_lr(stage0.optimizer, batch_size=int(cfg["train"]["batch_size"]))
+    optimizer = torch.optim.AdamW(
+        [
+            {
+                "params": list(predictor.parameters()),
+                "lr": effective_lr,
+                "initial_lr": effective_lr,
+                "weight_decay": float(stage0.optimizer.get("weight_decay", cfg["train"]["weight_decay"])),
+                "group_name": "predictor",
+            }
+        ],
+        betas=tuple(float(value) for value in stage0.optimizer.get("betas", (0.9, 0.999))),
+        eps=float(stage0.optimizer.get("eps", 1.0e-8)),
+    )
+    scheduler = build_scheduler(optimizer, stage0, steps_per_epoch=len(loaders["train_loader"]))
     train_rows = [
         {key: (int(value) if key == "epoch" else float(value) if key in {"train_loss", "val_loss", "lr", "best_fitness"} else value) for key, value in row.items()}
         for row in results_csv_rows(paths.results_csv)
@@ -1032,11 +1058,11 @@ def train_from_runtime_config(config: dict[str, Any]) -> AnomalyTrainResult:
             train_decode_times.append(float(batch.get("decode_time", 0.0)))
             model_start = time.perf_counter()
             past_feat, future_feat = _extract_pair_features(feature_extractor, batch, device)
-            predictor_scores, _ = _predict_sample_scores(predictor, past_feat, future_feat, cfg["model"], tubelet_size=feature_extractor.tubelet_size)
-            loss = predictor_scores.mean()
+            loss, _ = anomaly_future_prediction_loss(predictor, past_feat, future_feat, cfg["model"])
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
+            scheduler.step(global_step)
             train_model_times.append(float(time.perf_counter() - model_start))
             train_losses.append(float(loss.item()))
             global_step += 1
@@ -1046,23 +1072,80 @@ def train_from_runtime_config(config: dict[str, Any]) -> AnomalyTrainResult:
         val_losses: list[float] = []
         val_decode_times: list[float] = []
         val_model_times: list[float] = []
+        val_by_video: dict[str, dict[str, Any]] = {}
         with torch.no_grad():
             val_bar = _progress(loaders["val_loader"], desc=f"val {epoch}/{cfg['train']['epochs']}", total=len(loaders["val_loader"]))
             for batch in val_bar:
                 val_decode_times.append(float(batch.get("decode_time", 0.0)))
                 model_start = time.perf_counter()
                 past_feat, future_feat = _extract_pair_features(feature_extractor, batch, device)
-                predictor_scores, _ = _predict_sample_scores(predictor, past_feat, future_feat, cfg["model"], tubelet_size=feature_extractor.tubelet_size)
-                val_loss_value = float(predictor_scores.mean().item())
+                predictor_scores_t, frozen_scores_t = _predict_sample_scores(
+                    predictor,
+                    past_feat,
+                    future_feat,
+                    cfg["model"],
+                    tubelet_size=feature_extractor.tubelet_size,
+                )
+                val_loss_value = float(anomaly_future_prediction_loss(predictor, past_feat, future_feat, cfg["model"])[0].item())
                 val_model_times.append(float(time.perf_counter() - model_start))
                 val_losses.append(val_loss_value)
+                predictor_scores = predictor_scores_t.detach().cpu().numpy()
+                frozen_scores = frozen_scores_t.detach().cpu().numpy()
+                future_indices = batch["future_indices"].numpy()
+                labels = batch.get("future_labels")
+                labels_np = labels.numpy() if labels is not None else None
+                for i, video_name in enumerate(batch["video_name"]):
+                    state = val_by_video.setdefault(video_name, {"predictor_sum": {}, "predictor_count": {}, "frozen_sum": {}, "frozen_count": {}, "labels": {}, "has_labels": False})
+                    for local_idx, frame_idx in enumerate(future_indices[i]):
+                        idx = int(frame_idx)
+                        state["predictor_sum"][idx] = state["predictor_sum"].get(idx, 0.0) + float(predictor_scores[i, local_idx])
+                        state["predictor_count"][idx] = state["predictor_count"].get(idx, 0) + 1
+                        state["frozen_sum"][idx] = state["frozen_sum"].get(idx, 0.0) + float(frozen_scores[i, local_idx])
+                        state["frozen_count"][idx] = state["frozen_count"].get(idx, 0) + 1
+                    if labels_np is not None:
+                        state["has_labels"] = True
+                        for frame_idx, label_value in zip(future_indices[i], labels_np[i]):
+                            state["labels"][int(frame_idx)] = int(label_value)
                 if tqdm is not None:
                     val_bar.set_postfix(loss=f"{val_loss_value:.5f}")
-        scheduler.step()
         train_loss = float(np.mean(train_losses))
         val_loss = float(np.mean(val_losses))
         train_timings = _timing_metrics(decode_times=train_decode_times, model_times=train_model_times)
         val_timings = _timing_metrics(decode_times=val_decode_times, model_times=val_model_times)
+        val_cfg = dict(cfg.get("eval", {}))
+        val_summary = _finalize_video_summary(val_by_video)
+        val_smoothed = _build_smoothed_summary(val_summary, int(val_cfg.get("smoothing_window", 1)))
+        labels_raw, scores_pred_raw = _flatten_metric_arrays(val_summary, "predictor_scores")
+        _, scores_frozen_raw = _flatten_metric_arrays(val_summary, "frozen_scores")
+        labels_smooth, scores_pred_smooth = _flatten_metric_arrays(val_smoothed, "predictor_scores")
+        _, scores_frozen_smooth = _flatten_metric_arrays(val_smoothed, "frozen_scores")
+        predictor_threshold, frozen_threshold, calibration_labels, calibration_scores_pred, calibration_scores_frozen = _thresholds_from_smoothed_summary(val_smoothed, {"eval": val_cfg})
+        calibration_normals_pred = calibration_scores_pred[calibration_labels == 0] if np.any(calibration_labels == 0) else calibration_scores_pred
+        calibration_normals_frozen = calibration_scores_frozen[calibration_labels == 0] if np.any(calibration_labels == 0) else calibration_scores_frozen
+        predictor_clip = _clip_level_metrics(val_smoothed, "predictor_scores", threshold=predictor_threshold, reduction="max")
+        frozen_clip = _clip_level_metrics(val_smoothed, "frozen_scores", threshold=frozen_threshold, reduction="max")
+        val_metrics = {
+            "predictor_frame_auc_raw": _roc_auc_score(labels_raw, scores_pred_raw),
+            "frozen_diff_frame_auc_raw": _roc_auc_score(labels_raw, scores_frozen_raw),
+            "predictor_frame_auc": _roc_auc_score(labels_smooth, scores_pred_smooth),
+            "frozen_diff_frame_auc": _roc_auc_score(labels_smooth, scores_frozen_smooth),
+            "predictor_threshold": predictor_threshold,
+            "frozen_threshold": frozen_threshold,
+            "predictor_val_false_positive_rate": float(np.mean(calibration_normals_pred > predictor_threshold)) if len(calibration_normals_pred) else 0.0,
+            "frozen_val_false_positive_rate": float(np.mean(calibration_normals_frozen > frozen_threshold)) if len(calibration_normals_frozen) else 0.0,
+            "predictor_clip_auc": predictor_clip["auc"],
+            "predictor_clip_accuracy": predictor_clip["accuracy"],
+            "predictor_clip_precision": predictor_clip["precision"],
+            "predictor_clip_recall": predictor_clip["recall"],
+            "predictor_clip_specificity": predictor_clip["specificity"],
+            "predictor_clip_f1": predictor_clip["f1"],
+            "frozen_diff_clip_auc": frozen_clip["auc"],
+            "frozen_diff_clip_accuracy": frozen_clip["accuracy"],
+            "frozen_diff_clip_precision": frozen_clip["precision"],
+            "frozen_diff_clip_recall": frozen_clip["recall"],
+            "frozen_diff_clip_specificity": frozen_clip["specificity"],
+            "frozen_diff_clip_f1": frozen_clip["f1"],
+        }
         previous_best = best_val
         best_val = min(best_val, val_loss)
         train_rows.append(
@@ -1076,9 +1159,25 @@ def train_from_runtime_config(config: dict[str, Any]) -> AnomalyTrainResult:
                 "avg_train_model_time": train_timings["avg_model_time"],
                 "avg_val_decode_time": val_timings["avg_decode_time"],
                 "avg_val_model_time": val_timings["avg_model_time"],
+                **val_metrics,
             }
         )
         epoch_timing_rows.append({"epoch": epoch, **train_timings, **{f"val_{key}": value for key, value in val_timings.items()}})
+        metric_summary = " ".join(
+            [
+                f"epoch={epoch}",
+                f"train_loss={train_loss:.6f}",
+                f"val_loss={val_loss:.6f}",
+                f"predictor_frame_auc={val_metrics['predictor_frame_auc']:.4f}",
+                f"predictor_clip_auc={val_metrics['predictor_clip_auc']:.4f}",
+                f"predictor_clip_f1={val_metrics['predictor_clip_f1']:.4f}",
+                f"frozen_diff_frame_auc={val_metrics['frozen_diff_frame_auc']:.4f}",
+            ]
+        )
+        if tqdm is not None:
+            tqdm.write(metric_summary)
+        else:
+            print(metric_summary)
         write_results_csv(paths.results_csv, train_rows)
         if cfg["train"]["save"]:
             latest_payload = _checkpoint_payload(predictor, cfg, epoch=epoch, train_loss=train_loss, val_loss=val_loss, best_val_loss=best_val, effective_lr=effective_lr, checkpoint_kind="last")

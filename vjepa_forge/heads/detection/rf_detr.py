@@ -10,6 +10,7 @@ from scipy.optimize import linear_sum_assignment
 from torchvision.ops import generalized_box_iou
 
 from vjepa_forge.backbones.vjepa21 import BACKBONE_SPECS, VJEPAEnhancedPyramidAdapter, VJEPAFeaturePyramidAdapter, VJEPAImageBackbone
+from vjepa_forge.losses.detection.rf_detr import ForgeHungarianMatcher, ForgeSetCriterion, compute_rf_detr_loss
 from .box_ops import batched_nms_xyxy
 
 
@@ -382,8 +383,8 @@ class ForgeRFDETRHead(nn.Module):
         self.decoder = RFDETRDecoder(self.hidden_dim, int(num_heads), 3, int(num_decoder_layers))
         self.class_head = nn.Linear(self.hidden_dim, self.num_classes + 1)
         self.box_head = MLP(self.hidden_dim, self.hidden_dim, 4, 3)
-        self.matcher = HungarianMatcher()
-        self.criterion = SetCriterion(
+        self.matcher = ForgeHungarianMatcher()
+        self.criterion = ForgeSetCriterion(
             num_classes=self.num_classes,
             matcher=self.matcher,
             weight_dict={"loss_ce": 1.0, "loss_bbox": 5.0, "loss_giou": 2.0},
@@ -469,10 +470,7 @@ class ForgeRFDETRHead(nn.Module):
         else:
             flat_outputs = outputs
             targets = self._prepare_targets(labels, outputs["pred_logits"].device)
-        losses = self.criterion(flat_outputs, targets)
-        total = sum(self.criterion.weight_dict.get(name.split("_")[0], 1.0) * value for name, value in losses.items())
-        stats = {name: float(value.detach().cpu().item()) for name, value in losses.items()}
-        return total, stats
+        return compute_rf_detr_loss(self.criterion, flat_outputs, targets)
 
     def decode_predictions(
         self,

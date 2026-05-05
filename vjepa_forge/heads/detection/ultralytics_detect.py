@@ -10,6 +10,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from vjepa_forge.backbones.vjepa21 import VJEPAFeaturePyramidAdapter
+from vjepa_forge.losses.detection.ultralytics import compute_ultralytics_detection_loss
 from .box_ops import box_cxcywh_to_xyxy, box_iou, box_xyxy_to_cxcywh, clip_boxes_xyxy
 
 
@@ -222,8 +223,6 @@ class UltralyticsLikeDetectHead(nn.Module):
 
     def compute_loss(self, outputs: dict[str, Any], labels: dict[str, Any]) -> tuple[torch.Tensor, dict[str, float]]:
         if outputs["pred_logits"].ndim == 4:
-            flat_logits = outputs["pred_logits"].reshape(-1, outputs["pred_logits"].shape[-2], outputs["pred_logits"].shape[-1])
-            flat_boxes = outputs["pred_boxes"].reshape(-1, outputs["pred_boxes"].shape[-2], outputs["pred_boxes"].shape[-1])
             flat_targets: list[dict[str, Any]] = []
             for item in labels["detections"]:
                 frames = {}
@@ -232,38 +231,16 @@ class UltralyticsLikeDetectHead(nn.Module):
                 max_frames = outputs["pred_logits"].shape[1]
                 for frame_idx in range(max_frames):
                     flat_targets.append({"detections": frames.get(frame_idx, [])})
-            prepared = self._prepare_targets({"detections": flat_targets}, flat_logits.device)
+            prepared = self._prepare_targets({"detections": flat_targets}, outputs["pred_logits"].device)
         else:
-            flat_logits = outputs["pred_logits"]
-            flat_boxes = outputs["pred_boxes"]
-            prepared = self._prepare_targets(labels, flat_logits.device)
-
-        cls_loss = flat_logits.sum() * 0.0
-        box_loss = flat_boxes.sum() * 0.0
-        dfl_loss = flat_boxes.sum() * 0.0
-        for pred_logits, pred_boxes, target in zip(flat_logits, flat_boxes, prepared, strict=True):
-            assignment = self._assign_single(pred_boxes, pred_logits, target)
-            cls_targets = torch.zeros_like(pred_logits)
-            positive_mask = assignment["positive_mask"]
-            if positive_mask.any():
-                cls_targets[positive_mask, assignment["labels"][positive_mask]] = 1.0
-            cls_loss = cls_loss + F.binary_cross_entropy_with_logits(pred_logits, cls_targets, reduction="mean")
-            if positive_mask.any():
-                pos_pred_boxes = pred_boxes[positive_mask]
-                pos_tgt_boxes = assignment["boxes"][positive_mask]
-                box_loss = box_loss + F.l1_loss(pos_pred_boxes, pos_tgt_boxes, reduction="mean")
-                pred_xyxy = box_cxcywh_to_xyxy(pos_pred_boxes)
-                tgt_xyxy = box_cxcywh_to_xyxy(pos_tgt_boxes)
-                lt = (pred_xyxy[..., :2] - tgt_xyxy[..., :2]).abs()
-                rb = (pred_xyxy[..., 2:] - tgt_xyxy[..., 2:]).abs()
-                dfl_loss = dfl_loss + (lt.mean() + rb.mean()) * 0.5
-        total = cls_loss + 5.0 * box_loss + 1.5 * dfl_loss
-        stats = {
-            "loss_cls": float(cls_loss.detach().cpu().item()),
-            "loss_box": float(box_loss.detach().cpu().item()),
-            "loss_dfl": float(dfl_loss.detach().cpu().item()),
-        }
-        return total, stats
+            prepared = self._prepare_targets(labels, outputs["pred_logits"].device)
+        return compute_ultralytics_detection_loss(
+            outputs,
+            prepared,
+            reg_max=self.reg_max,
+            num_classes=self.num_classes,
+            assign_single=self._assign_single,
+        )
 
     def decode_predictions(
         self,

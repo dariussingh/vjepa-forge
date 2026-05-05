@@ -4,10 +4,9 @@ from typing import Any
 
 import torch
 from torch import nn
-import torch.nn.functional as F
 
 from vjepa_forge.heads.segmentation import InstanceSegmentationHead, SemanticSegmentationHead, VideoSemanticSegmentationHead
-from vjepa_forge.heads.segmentation.losses import build_instance_targets, build_semantic_targets, dice_loss, match_instances, sigmoid_ce_mask_loss
+from vjepa_forge.losses.segmentation import instance_segmentation_loss, semantic_segmentation_loss
 
 
 class ForgeSegmentHead(nn.Module):
@@ -17,6 +16,7 @@ class ForgeSegmentHead(nn.Module):
         super().__init__()
         model_cfg = {} if model_cfg is None else dict(model_cfg)
         segmenter_cfg = dict(model_cfg.get("segmenter", {}))
+        self._loss_cfg = dict(model_cfg.get("loss", {}))
         self.strategy = str(segmenter_cfg.get("type", model_cfg.get("strategy", "ultralytics"))).lower()
         self.media = media
         self.num_classes = int(num_classes)
@@ -52,54 +52,17 @@ class ForgeSegmentHead(nn.Module):
 
     def compute_segmentation_loss(self, outputs: torch.Tensor | dict[str, torch.Tensor], labels: dict[str, Any]) -> tuple[torch.Tensor, dict[str, float]]:
         if self.strategy == "ultralytics":
-            if isinstance(outputs, dict):
-                logits = outputs["pred_logits"]
-                targets = build_semantic_targets(labels["segments"], num_classes=self.num_classes, output_size=int(logits.shape[-1]), video_frames=int(logits.shape[1])).to(logits.device)
-                flat_logits = logits.reshape(-1, logits.shape[2], logits.shape[3], logits.shape[4])
-                loss = F.cross_entropy(flat_logits, targets)
-                return loss, {"loss_ce": float(loss.detach().cpu().item())}
-            if outputs.ndim == 5:
-                targets = build_semantic_targets(labels["segments"], num_classes=self.num_classes, output_size=int(outputs.shape[-1]), video_frames=int(outputs.shape[2])).to(outputs.device)
-                logits = outputs.permute(0, 2, 1, 3, 4).reshape(-1, outputs.shape[1], outputs.shape[3], outputs.shape[4])
-                targets = targets.to(outputs.device)
-            else:
-                targets = build_semantic_targets(labels["segments"], num_classes=self.num_classes, output_size=int(outputs.shape[-1])).to(outputs.device)
-                logits = outputs
-            loss = F.cross_entropy(logits, targets)
-            return loss, {"loss_ce": float(loss.detach().cpu().item())}
+            return semantic_segmentation_loss(outputs, labels, num_classes=self.num_classes, lambda_dice=float(self.model_cfg_loss().get("lambda_dice", 1.0)))
+        return instance_segmentation_loss(
+            outputs,
+            labels,
+            num_classes=self.num_classes,
+            lambda_mask=float(self.model_cfg_loss().get("lambda_mask", 5.0)),
+            lambda_dice=float(self.model_cfg_loss().get("lambda_dice", 5.0)),
+        )
 
-        if outputs["pred_logits"].ndim == 4:
-            flat_logits = outputs["pred_logits"].reshape(-1, outputs["pred_logits"].shape[-2], outputs["pred_logits"].shape[-1])
-            flat_masks = outputs["pred_masks"].reshape(-1, outputs["pred_masks"].shape[-3], outputs["pred_masks"].shape[-2], outputs["pred_masks"].shape[-1])
-            targets = build_instance_targets(
-                [{"segments": [ann for ann in item["segments"] if int(ann["frame_idx"]) == frame_idx]} for item in labels["segments"] for frame_idx in range(outputs["pred_masks"].shape[1])],
-                output_size=int(flat_masks.shape[-1]),
-            )
-        else:
-            flat_logits = outputs["pred_logits"]
-            flat_masks = outputs["pred_masks"]
-            targets = build_instance_targets(labels["segments"], output_size=int(flat_masks.shape[-1]))
-
-        cls_loss = flat_logits.sum() * 0.0
-        mask_bce = flat_masks.sum() * 0.0
-        mask_dice = flat_masks.sum() * 0.0
-        for pred_logits, pred_masks, target in zip(flat_logits, flat_masks, targets, strict=True):
-            src_idx, tgt_idx = match_instances(pred_logits, pred_masks, {k: v.to(pred_logits.device) for k, v in target.items()})
-            target_classes = torch.full((pred_logits.shape[0],), self.num_classes, dtype=torch.int64, device=pred_logits.device)
-            if src_idx.numel():
-                target_classes[src_idx] = target["labels"].to(pred_logits.device)[tgt_idx]
-            cls_loss = cls_loss + F.cross_entropy(pred_logits, target_classes)
-            if src_idx.numel():
-                selected_masks = pred_masks[src_idx]
-                selected_targets = target["masks"].to(pred_masks.device)[tgt_idx]
-                mask_bce = mask_bce + sigmoid_ce_mask_loss(selected_masks, selected_targets).mean()
-                mask_dice = mask_dice + dice_loss(selected_masks, selected_targets).mean()
-        total = cls_loss + 5.0 * mask_bce + 5.0 * mask_dice
-        return total, {
-            "loss_ce": float(cls_loss.detach().cpu().item()),
-            "loss_mask": float(mask_bce.detach().cpu().item()),
-            "loss_dice": float(mask_dice.detach().cpu().item()),
-        }
+    def model_cfg_loss(self) -> dict[str, Any]:
+        return dict(getattr(self, "_loss_cfg", {}))
 
     def decode_predictions(self, outputs: torch.Tensor | dict[str, torch.Tensor], *, threshold: float = 0.5):
         if self.strategy == "ultralytics":
