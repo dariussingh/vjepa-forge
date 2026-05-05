@@ -97,6 +97,18 @@ def _loader_kwargs(
     return kwargs
 
 
+def _dali_active(video_backend: str) -> bool:
+    if video_backend == "dali":
+        return True
+    if video_backend == "auto":
+        try:
+            import nvidia.dali  # noqa: F401
+            return True
+        except Exception:
+            return False
+    return False
+
+
 def _make_loaders(cfg: dict[str, Any], include_test: bool = True, *, feature_extractor: nn.Module | None = None, device: torch.device | None = None, runtime=None) -> dict[str, Any]:
     dataset_cfg = cfg["dataset"]
     train_videos = _build_video_records(dataset_cfg["dataset_yaml"], split="train")
@@ -123,8 +135,9 @@ def _make_loaders(cfg: dict[str, Any], include_test: bool = True, *, feature_ext
     val_ds.reader_cache_size = int(cfg["eval"]["reader_cache_size"])
     if test_ds is not None:
         test_ds.reader_cache_size = int(cfg["eval"]["reader_cache_size"])
-    train_num_workers = int(cfg["train"]["num_workers"])
-    eval_num_workers = int(cfg["eval"]["num_workers"])
+    # DALI initializes CUDA in the main process; forked workers cannot re-initialize it.
+    train_num_workers = 0 if _dali_active(video_backend) else int(cfg["train"]["num_workers"])
+    eval_num_workers = 0 if _dali_active(video_backend) else int(cfg["eval"]["num_workers"])
     train_collate = partial(
         _collate_window_batch,
         image_size=image_size,
@@ -196,7 +209,7 @@ def _build_eval_loader(
     video_backend = str(dataset_cfg.get("video_backend", "auto"))
     ds = ForgeAnomalyWindowDataset(videos, windows, dataset_cfg["image_size"], video_backend=video_backend)
     ds.reader_cache_size = int(cfg["eval"]["reader_cache_size"])
-    worker_count = int(cfg["eval"]["num_workers"] if num_workers is None else num_workers)
+    worker_count = 0 if _dali_active(video_backend) else int(cfg["eval"]["num_workers"] if num_workers is None else num_workers)
     resolved_batch_size = int(cfg["eval"]["batch_size"] if batch_size is None else batch_size)
     loader_kwargs = _loader_kwargs(
         batch_size=resolved_batch_size,
